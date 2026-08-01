@@ -203,7 +203,7 @@ and silence and **not** pause.
 | Which minutes did it cover? | `silver_session_minutes` | `ReplacingMergeTree` |
 | **How many concurrent at minute M?** | **`gold_concurrency_minute`** | `SummingMergeTree` |
 | Hot / open-session updates | `gold_concurrency_delta` | `SummingMergeTree` |
-| Hour & day grain | `gold_concurrency_hour` | `AggregatingMergeTree` |
+| Hour & day grain | `gold_concurrency_minute` + `toStartOfHour()` | `SummingMergeTree` |
 
 ### Evaluation order
 
@@ -248,7 +248,7 @@ Order matters — later rules override earlier ones.
 | E4 | Duplicate `SessionStart`/`End` | 13 / 14 | double-counted sessions |
 | E5 | Sessions ending backgrounded | 418 | wrongly reopened |
 | E6 | Sessions spanning >1 day | 16 | dropped by date partitioning |
-| E7 | Session with >1 platform / user | 95 / 120 | non-reproducible — use `argMin` |
+| E7 | Session with >1 platform / user | 95 / 120 | non-reproducible — use `argMin`. Impact ~0.3% (noise) |
 | E8 | Missing minutes in sparse dims | FIRE_TV 2/60 | `avg` wrong (`max` safe) |
 | E9 | `VideoError` treated as terminal | 55 sessions | truncated early |
 | E10 | Overlapping sessions per user | 17,397 pairs / 61 users | user-level ≠ session-level |

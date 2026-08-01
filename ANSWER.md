@@ -17,7 +17,7 @@ bronze_content      33,464  ──┴─►  silver_session_dim   10,866   │  
                                    silver_session_timeline       │
                                    silver_active_intervals 27,251├─► gold_concurrency_delta
                                    silver_session_minutes 140,434│        21,647  ◀ hot path
-                                   silver_merged_runs            └─► gold_concurrency_hour
+                                   silver_merged_runs
 ```
 
 **Serving layer = 10.3% of raw.** Queries never touch bronze or silver.
