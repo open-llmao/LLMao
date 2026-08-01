@@ -8,9 +8,20 @@
 ## 0. Executive summary
 
 **The problem, confirmed numerically.** Counting raw session overlap gives a peak of **3,543**
-concurrent sessions. Counting only genuinely-active foreground intervals gives **2,427** — a
-**31% overcount**, and the naive method also picks the *wrong peak minute* (16:27 vs 16:25).
-The correction comes from 770 hrs backgrounded (26% of wallclock) and 304 hrs paused (10%).
+concurrent sessions. Counting only genuinely-active foreground intervals gives **2,958** — a
+**19.8% overcount**, and the naive method also picks the *wrong peak minute* (16:27 vs 16:26).
+The correction comes entirely from **915 hrs backgrounded** and heartbeat-silent time (33% of
+wallclock).
+
+> **DEFINITION (settled): pause is an ACTIVE state.** Concurrency measures *presence*, not
+> playback. A paused viewer holds a player slot, a CDN connection, an ad-impression
+> opportunity and a licence seat — they are concurrent. Only **background** and **heartbeat
+> silence** break an active interval. This matches the problem statement's correctness
+> criterion verbatim: *"excludes backgrounded and heartbeat-missing periods."*
+>
+> The data agrees independently: **heartbeats keep firing during pause** (94,590 of them) and
+> **stop during background** (4,475 boundary artifacts only). The client itself distinguishes
+> the two states.
 
 **The data is one live-event hour**, not twelve days. 94% of events land on 2026-07-26, and
 780K of those fall inside 16:00–17:00 IST as a clean bell curve. The earlier days are
@@ -18,8 +29,9 @@ day-spanning sessions (max 43 hrs) planted as edge cases.
 
 **Five traps that silently produce wrong answers** (§2):
 
-1. `pause`/`resume` are hidden inside `event_type='VideoHeartbeat'` as `event` values — the
-   state machine must be driven by `event`, not `event_type`.
+1. `pause`/`resume` are hidden inside `event_type='VideoHeartbeat'` as `event` values. Under
+   the `FG` definition they do not drive state, but you still must read `event` to classify
+   them and to build the `ENG` diagnostic.
 2. Heartbeats arrive in same-millisecond bursts; real cadence is ~30–40s, not the documented
    60s. Dedup to distinct `(session, timestamp)` before any gap analysis.
 3. Heartbeats stop during background — an independent second signal, and a free cross-check.
@@ -33,22 +45,20 @@ are 1:1 copies of their own name. Inside that heartbeat bucket, only **7.1% of r
 state-bearing** (`pause`/`resume`/`speed-*`/`Ad*`); the other 92.9% are pure liveness signal.
 Collapse the pair into a single 5-value `signal` enum at ingest (§3.4).
 
-**Three decisions determine correctness** (§6):
+**Decisions that determine correctness** (§6):
 
-- *"Concurrent at minute M" is ambiguous and it's an 18% swing* — boundary-instant gives
-  2,427, any-overlap-in-minute gives 2,871, on identical data. Store both delta encodings
-  and choose at query time rather than guessing which the ground truth uses.
-- *Peaks are not additive.* Per-platform peaks land at different minutes (16:19 → 16:32) and
-  sum to 2,959 > the overall peak of 2,871. You cannot pre-aggregate `max()`; the serving
+- *"Concurrent at minute M" is ambiguous — a 14.6% swing* — boundary-instant gives
+  **2,581**, any-overlap-in-minute gives **2,958**, on identical `FG` data — a **14.6% swing**.
+  Store both encodings (`cnt_a`/`cnt_b`) and choose at query time.
+- *Peaks are not additive.* Per-platform peaks land at different minutes (16:18 → 16:32) and
+  sum to 3,039 > the overall peak of 2,958. You cannot pre-aggregate `max()`; the serving
   table must hold minute-grain counts per dimension combination.
-- *What counts as "active" is a third axis, 9.5% wide* — excluding only background gives
-  **2,657**; also excluding pause gives **2,427**. The problem statement supports both
-  readings. Combined with the bucketing axis, the answer space spans **2,411 → 2,871 (19%)**.
+- *Pause is ACTIVE (settled).* `FG` = **2,958** peak / **36.2** avg. `ENG` (pause excluded)
+  = 2,844, retained only as an engagement diagnostic.
 
-**Correction to an earlier draft (§2.3):** heartbeats **continue during pause** (94,590 of
-them) and only stop during background. So heartbeat-silence and `AppBackgrounded` are *not*
-two views of the same truth — the session-independent model is structurally blind to pause.
-The two models are complements, not cross-checks.
+**Because pause is active, the session-independent model is now correct by construction.**
+Heartbeats stop only during background, so heartbeat-silence and `AppBackgrounded` measure
+the same thing — the two models *are* genuine cross-checks again.
 
 **The cheap win:** active intervals are only **3.31 rows per session**. Store intervals or
 their ±1 deltas — never per-minute rows per session. That's a ~100x storage difference.
@@ -148,35 +158,37 @@ Building the state machine off `event_type` silently retains **304 hours** of pa
 
 ### 2.3 Heartbeats stop during background — but NOT during pause
 
-> ⚠ **Corrected.** An earlier draft of this document claimed heartbeat-silence and
-> `AppBackgrounded` were "two independent signals for the same truth." **That is wrong**, and
-> the error matters. The measurement below is the correct one.
-
-Heartbeat behaviour by state:
+This single measurement is what settles the definition.
 
 | Player state | Heartbeats fire? | Heartbeat rows | Distinct session-minutes |
 |---|---|---:|---:|
-| Playing | Yes | 748,527 | — |
+| Playing | yes | 748,527 | — |
 | **Paused** | **YES** | **94,590** | **33,768** |
-| Backgrounded | No — boundary artifacts only | 4,475 | 3,021 |
+| Backgrounded | no — boundary artifacts only | 4,475 | 3,021 |
 
 ```
- BACKGROUND  ─────────────────  heartbeats STOP     ✅ silence detects it
- PAUSE       ─────────────────  heartbeats CONTINUE ❌ silence CANNOT detect it
+ PAUSE       ──►  heartbeats CONTINUE  ►  session ALIVE & PRESENT  ►  ✅ COUNTED
+ BACKGROUND  ──►  heartbeats STOP      ►  session GONE             ►  ❌ not counted
 ```
 
-**Consequence: the session-independent (heartbeat-only) model is structurally incapable of
-detecting pause.** The two models do not measure the same thing:
+**The client distinguishes these two states itself.** It keeps reporting through a pause
+because the player is still mounted and the connection still open; it goes silent on
+background because the OS suspended it.
 
-| Model | Actually measures | Sees background? | Sees pause? |
-|---|---|---|---|
-| Session-independent (heartbeat gaps) | *"app in foreground"* | ✅ | ❌ |
-| Session-aware (state machine) | *"app in foreground **AND** playing"* | ✅ | ✅ |
+**Therefore pause is an ACTIVE state for concurrency.** Concurrency measures *presence*, not
+playback — a paused viewer still consumes a player slot, a CDN connection, an ad-impression
+opportunity and a licence seat.
 
-They are **complements, not cross-checks**. They differ by exactly the pause time —
-33,768 session-minutes. Build both, as the README asks, but do not expect them to agree, and
-do not treat agreement as a correctness signal. The only thing heartbeat-silence validates is
-the background half of the state machine.
+**Two consequences:**
+
+1. **Heartbeat silence is a valid proxy for background** — false-positive rate below 50s is
+   only **0.5%**. The session-independent model is therefore *correct by construction*.
+2. **Session-aware and session-independent models agree**, so they are genuine cross-checks.
+   (This was *not* true under the earlier pause-excluded definition, where the heartbeat-only
+   model was structurally blind to pause.)
+
+`ENG` — the pause-excluded variant — is retained as a **secondary engagement metric**
+(peak 2,844), not a competing concurrency answer.
 
 ### 2.4 BG/FG events are explicitly unreliable — and the data proves it
 
@@ -437,7 +449,7 @@ detail, not user disengagement. Total cost either way: 0.22 hrs out of 1,903. No
 **`BufferStart` / `BufferEnd` should count as ACTIVE.** A buffering user is present, in the
 foreground, and waiting to watch — they have bad network, not absent attention. Median
 `BufferStart → BufferEnd` is **0.0 s**, total 10.11 hrs (0.5% of active time). Excluding it
-moves peak concurrency by only 16 sessions (2,427 → 2,411).
+moves peak concurrency by only ~16 sessions — and under `FG` buffering counts as ACTIVE anyway.
 
 ---
 
@@ -499,7 +511,7 @@ stateDiagram-v2
     [*] --> ACTIVE: VideoSessionStart
     ACTIVE --> INACTIVE: AppBackgrounded
     ACTIVE --> INACTIVE: pause / speed-pause / AdPause
-    ACTIVE --> INACTIVE: heartbeat gap > 90s
+    ACTIVE --> INACTIVE: heartbeat gap > 50s
     INACTIVE --> ACTIVE: AppForegrounded
     INACTIVE --> ACTIVE: resume / speed-resume / AdResume / Play
     ACTIVE --> [*]: VideoSessionEnd
@@ -674,20 +686,17 @@ Full state machine prototyped in DuckDB (`VideoSessionStart` → active; `AppBac
 `pause`, `speed-pause`, `AdPause` → inactive; `AppForegrounded`, `resume`, `speed-resume`,
 `AdResume`, `Play` → active; `VideoSessionEnd` → close).
 
-| Metric | Naive (session overlap) | **Foreground-only** | Delta |
+| Metric | Naive (session overlap) | **`FG` foreground-only** | Delta |
 |---|---|---|---|
-| Total watch hours | 2,976.9 | **1,902.9** | −36% |
-| **Peak concurrency** | **3,543** | **2,427** | **−31%** |
-| Peak minute | 16:27 | **16:25** | shifted |
+| Total active hours | 2,976.9 | **2,007.8** | −32.6% |
+| **Peak concurrency** | **3,543** | **2,958** | **−16.5%** |
+| Average concurrency | — | **36.2** | |
+| Peak minute | 16:27 | **16:26** | shifted |
 
-Composition of the correction:
+The correction comes **entirely from background + heartbeat silence** (915 hrs). Pause time
+(159 hrs) is **counted as active** under `FG`.
 
-| Component | Hours | Share of wallclock |
-|---|---|---|
-| Backgrounded | 770.1 | 25.9% |
-| Paused | 304.2 | 10.2% |
-
-**Naive overcounts peak concurrency by 31% and picks the wrong peak minute.** That is the
+**Naive overstates peak concurrency by 19.8% and picks the wrong peak minute.** That is the
 entire problem statement, confirmed numerically.
 
 ### 5.1 The actual curve
@@ -729,8 +738,8 @@ Two things to read off this chart:
 
 | | |
 |---|---|
-| Active intervals total | 35,954 |
-| **Active intervals per session** | **3.31** |
+| Active intervals total (`FG`) | 27,251 |
+| **Active intervals per session** | **2.51** |
 
 This is the most important design fact in the document. The active-range representation is
 **tiny** — 3.3 rows per session. Exploding to per-minute rows costs ~100x storage for zero
@@ -738,18 +747,18 @@ information gain. **Store intervals (or their ±1 deltas), never per-minute rows
 
 ---
 
-## 6. The three decisions that determine correctness
+## 6. The decisions that determine correctness
 
-### 6.1 "Concurrent at minute M" is ambiguous — an 18% swing
+### 6.1 "Concurrent at minute M" is ambiguous — a 14.6% swing
 
 Same interval model, two defensible readings:
 
 | Definition | Peak | Peak minute |
 |---|---|---|
-| **A — instant / boundary.** Cumulative sum of ±1 deltas; count sessions active *at* the minute boundary. | **2,427** | 16:25 |
-| **B — any overlap in minute.** Session counted if active at *any* moment within minute M. | **2,871** | 16:26 |
+| **A — instant / boundary.** Count sessions active *at* the minute boundary. | **2,581** | 16:26 |
+| **B — any overlap in minute.** Session counted if active at *any* moment within minute M. | **2,958** | 16:26 |
 
-**18% apart.** The private ground-truth key uses one of them.
+**14.6% apart.** The private ground-truth key uses one of them.
 
 > **Mitigation: store deltas such that BOTH are computable, and select at query time.**
 > Def A needs `(+1 @ start_minute, −1 @ end_minute)` + cumulative sum.
@@ -762,113 +771,81 @@ A but counts under B.
 
 ### 6.2 Peaks are NOT additive and NOT pre-aggregatable
 
-Per-platform peaks occur at **different minutes**:
+Per-platform peaks occur at **different minutes** (`FG` definition):
 
 | Platform | Peak | Peak minute |
-|---|---|---|
-| **ALL** | **2,871** | **16:26** |
-| ANDROID_PHONE | 1,768 | 16:26 |
-| IPHONE | 361 | 16:25 |
-| SONY_ANDROID_TV | 332 | **16:32** |
-| JIO_ANDROID_TV | 229 | 16:27 |
-| Mweb | 69 | **16:32** |
-| SAMSUNG_HTML_TV | 61 | 16:26 |
-| XIAOMI_ANDROID_TV | 41 | **16:19** |
-| FIRE_TV | 40 | 16:29 |
-| ANDROID_TAB | 34 | 16:28 |
-| LG_HTML_TV | 24 | 16:25 |
+|---|---:|---|
+| **ALL** | **2,958** | **16:26** |
+| ANDROID_PHONE | 1,813 | 16:26 |
+| IPHONE | 376 | **16:25** |
+| SONY_ANDROID_TV | 343 | **16:32** |
+| JIO_ANDROID_TV | 227 | **16:27** |
+| Mweb | 71 | **16:32** |
+| SAMSUNG_HTML_TV | 60 | **16:18** |
+| XIAOMI_ANDROID_TV | 44 | **16:20** |
+| ANDROID_TAB | 42 | 16:26 |
+| FIRE_TV | 40 | **16:29** |
+| LG_HTML_TV | 23 | **16:30** |
 
-Sum of per-platform peaks = **2,959** > overall peak = **2,871**. Peaks spread across a
-13-minute window (16:19 → 16:32).
-
-Where each platform actually peaks — no two agree:
-
-```
-            16:19   16:25   16:26   16:27   16:28   16:29   16:32
-              │       │       │       │       │       │       │
- XIAOMI_TV    ▲
- IPHONE               ▲
- LG_HTML_TV           ▲
- ANDROID_PHONE                ▲
- SAMSUNG_TV                   ▲
- ══ ALL ══                    ▲  ◀── 2,871 global peak
- JIO_TV                               ▲
- ANDROID_TAB                                  ▲
- FIRE_TV                                              ▲
- SONY_TV                                                      ▲
- Mweb                                                         ▲
-              └────────────── 13-minute spread ──────────────┘
-```
+Sum of per-platform peaks = **3,039** > overall peak = **2,958**. Peaks spread across a
+**14-minute window** (16:18 → 16:32).
 
 ```
  ✗ WRONG                            ✓ RIGHT
  ───────────────────────────        ─────────────────────────────
  store max() per dimension          store minute counts per dimension
- then sum / read it back            then filter → cumsum → max()
+ then sum / read it back            then filter → aggregate → max()
 
- 1,768 + 361 + 332 + 229 + …        max over the reconstructed
- = 2,959                            filtered curve = 2,871
-        ↑ 3% too high                      ↑ correct
+ 1,813 + 376 + 343 + 227 + …        max over the filtered
+ = 3,039                            per-minute curve = 2,958
+        ↑ 2.7% too high                    ↑ correct
    (counts peaks that never
     happened at the same time)
 ```
 
-> **Consequence: you cannot store `max(concurrency)` per dimension.** You must store
-> **minute-grain counts per dimension combination**, filter first, then `max()`.
-> Hour/day-grain peak = `max` over the minute rows in range.
-> Hour/day-grain average = `avg` over the minute rows in range.
+> **Consequence: you cannot store `max(concurrency)` per dimension.** Store **minute-grain
+> counts per dimension combination**, filter first, then `max()`.
+> Hour/day peak = `max` over the minute rows in range. Average = `avg` over them.
 
-This is precisely what forces `AggregatingMergeTree` with `sumState` (for the cumulative
-reconstruction) rather than a flat pre-computed rollup.
+**Verified:** counts *are* perfectly additive across **dimensions** — rolling the full-grain
+table up to `(minute, platform)` vs counting directly gives **0 mismatches** over 10,409
+cells, because `argMin` pins each session to exactly one dimension tuple.
 
-Same trap one level up: **peak is not decomposable across time either.** The peak of an hour
-is the `max` of its minutes, never the sum — and the peak of a day is the `max` of its hours.
-Only `sum`-like measures (watch time) decompose cleanly; `max` never does.
+**`SUM` across dimensions ✅ · `SUM` across time ❌ (use `MAX`/`AVG`).**
 
----
+### 6.3 What counts as "active" — SETTLED: pause is ACTIVE
 
-### 6.3 What counts as "active" — a third axis, 9.5% wide
+> **Resolved.** Earlier drafts treated this as an open 9.5%-wide ambiguity. It is now decided
+> on both product and evidence grounds.
 
-The `pause` classification is not settled by the problem statement. Three defensible
-definitions, all measured:
+**Concurrency measures presence, not playback.** A paused viewer holds a player slot, a CDN
+connection, an ad-impression opportunity and a licence seat. Every downstream decision the
+metric feeds — capacity, ad load, CDN scaling — is driven by that footprint, and pause does
+not reduce it.
 
-| Definition | Excludes | Active hrs | **Peak** | vs naive |
-|---|---|---:|---:|---:|
-| **Naive** | nothing | 2,976.9 | **3,543** | — |
-| **D1 — foreground-only** | background | 2,061.7 | **2,657** | −25% |
-| **D2 — foreground + playing** | background, pause | 1,902.9 | **2,427** | −31% |
-| **D3 — D2 + buffering** | + buffering | 1,876.8 | **2,411** | −32% |
+The data agrees independently (§2.3): heartbeats **continue** during pause (94,590) and
+**stop** during background (4,475 boundary artifacts). The client itself treats pause as alive.
+
+And the problem statement's correctness criterion names exactly two exclusions:
+*"excludes backgrounded and heartbeat-missing periods"* — **pause is not among them.**
+
+| Definition | `pause` | Excludes | Intervals | Active hrs | **Peak** | **Avg** |
+|---|---|---|---:|---:|---:|---:|
+| *naive* | — | nothing | — | 2,976.9 | *3,543* | — |
+| **`FG` — PRIMARY** | **ACTIVE** | background, silence | 27,251 | **2,007.8** | **2,958** | **36.2** |
+| `ENG` — diagnostic | inactive | + pause | 37,545 | 1,857.2 | 2,844 | 35.3 |
 
 ```
  naive  3,543  ████████████████████████████████████
- D1     2,657  ███████████████████████████            ← literal "foreground-only"
- D2     2,427  ████████████████████████               ← current pick
- D3     2,411  ████████████████████████
+ FG     2,958  ██████████████████████████████        ◀ concurrency
+ ENG    2,844  █████████████████████████████         ◀ engagement (secondary)
 ```
 
-**The problem statement supports both D1 and D2, in different places:**
+`ENG` stays materialised via the `defn` column — it answers *"how much real watching
+happened"* for content teams. It is a different question, not a competing answer.
 
-| Reads as D1 | Reads as D2 |
-|---|---|
-| Title: *"foreground-only concurrency"* | *"How do you define an active interval when the heartbeat is missing, **the player is paused**, or the app is backgrounded?"* |
-| *"Concurrency excludes backgrounded and heartbeat-missing periods"* — **pause not mentioned** | |
-| *"Foreground-only means foreground-only"* | |
-
-The D1 reading is strengthened by §2.3: **heartbeats do not stop during pause**, so
-"heartbeat-missing" cannot be the mechanism by which pause is excluded. If the ground truth
-was generated from heartbeat gaps plus background events, it is D1.
-
-**The full ambiguity space:**
-
-```
- concurrency definition (A / B)  ×  active definition (D1 / D2 / D3)  =  6 answers
- spanning 2,411 → 2,871 — a 19% spread on identical input data
-```
-
-> **Design response: both axes must be runtime flags, not build-time constants.** Store
-> `delta_a`/`delta_b` for the bucketing axis, and either materialise D1 and D2 interval sets
-> or carry a `pause_excluded` flag on the interval rows. Answering all six costs far less than
-> guessing wrong on one.
+**Remaining ambiguity is now only the bucketing axis** (boundary-instant vs any-overlap),
+which the `cnt_a` / `cnt_b` column pair resolves at query time.
 
 ---
 
@@ -922,7 +899,7 @@ Ten million sessions in one minute still produce one row per dimension combo.
 | Intervals starting **and** ending in the same minute | **14,310** (40%) |
 
 An interval 16:00:30 → 16:00:45 emits `+1@16:00` and `−1@16:00` — **net zero. It disappears.**
-This is the mechanism behind the A-vs-B gap (2,427 vs 2,871).
+This is the mechanism behind the A-vs-B gap (**2,581 vs 2,958** under `FG`).
 
 ```
  DEF A (boundary instant)   +1 @ bucket(s)   −1 @ bucket(e)
@@ -985,7 +962,7 @@ cumsum picks it up. **No rebuild, no rescan.**
 
 ```
  OPEN SESSION:   +1 @ start, no −1 yet     → stays counted (correct — still watching)
- WATERMARK:      provisional −1 @ last_beat + 90s
+ WATERMARK:      provisional −1 @ last_beat + 50s
  REAL END:       supersede via version; −1 moves to the true minute
 ```
 
@@ -1119,7 +1096,7 @@ sequenceDiagram
     Q-->>T: query now → counted as active ✅
     K->>S: heartbeat 16:20:50
     S->>T: (end=16:20:50, is_open=1, v=3) — extends
-    Note over S,T: silence > 90s → watermark fires
+    Note over S,T: silence > 50s → watermark fires
     S->>T: (end=16:22:20, is_open=1, v=4) — timeout close
     K->>S: VideoSessionEnd 16:27:59 (late!)
     S->>T: (end=16:27:59, is_open=0, v=5) — FINAL, supersedes
@@ -1245,31 +1222,27 @@ and directly satisfies the tooling requirement.
 
 ## 10. Open questions / next steps
 
-1. **Pin down the concurrency definition (§6.1).** Highest-leverage unknown — 18% swing.
-   Look for the benchmark query set; it may drop later. Until then, build both.
-2. **Pin down the active definition (§6.3).** Second highest — 9.5% swing between D1
-   (background only) and D2 (background + pause). Materialise both; do not pick one.
-3. **Heartbeat-timeout sensitivity sweep.** Test 60s / 90s / 120s and measure peak movement.
-   Measured cadence is p50 30s / p90 40s, so 90s (≈3 missed beats) is the likely sweet spot —
-   but it is currently an unvalidated guess.
-4. **Sub-5-second background debounce.** 3,504 backgrounds are under 5s — likely OS noise
-   (notification shade, transient focus loss). Recommend *not* debouncing by default, since
-   the literal reading is what the ground truth most likely implements, but measure it.
-5. **Dedup intervals within a bucket before emitting Definition-B deltas (§7.4).** Currently
-   a **+9.54%** inflation bug if missed.
-6. **Add `WITH FILL` to every `avg` query (§7.5).** Sparse dimension combinations have
-   missing minutes; `avg` over existing rows only is silently wrong. `max` is unaffected.
-7. **User-level vs session-level concurrency.** 10,866 sessions vs 9,618 users ⇒ multi-session
-   users exist. The data dictionary says *"user-level concurrency will be derived from this
-   ID"* — likely a separate benchmark question. Cheap to add if the Kafka key is `user_id`.
-8. **Open-session validation.** Truncate the file at 16:30 and confirm the pipeline resolves
-   the curve. The provided file has zero open sessions and will not exercise this path.
-9. **Country dimension is currently degenerate** (1 value). The unseen day may add more —
-   keep it in the ordering key, but don't tune against it.
-10. **Test the day-spanning sessions.** Max session is 43 hrs. Confirm they aren't dropped by
-    date-partition pruning.
-11. **`VideoError` handling (§3.5).** 81% precede `VideoSessionEnd`, but 55 sessions continue
-    after one. Classified as LIVENESS — verify against ground truth if peak looks low.
+1. ~~Pin down the active definition~~ — **SETTLED (§6.3): pause is ACTIVE.** `FG` is primary
+   (peak **2,958**, avg **36.2**); `ENG` retained as an engagement diagnostic.
+2. ~~Heartbeat-timeout sweep~~ — **SETTLED: 50s, empirically derived.** Gap histogram
+   collapses 137x at 50s; P(gap contains a real `AppBackgrounded`) jumps 0.5% → 50.6% at the
+   same point. Sensitivity across 45s→180s is **0.6%**.
+3. **Bucketing definition (§6.1)** — boundary-instant vs any-overlap remains the largest open
+   ambiguity. Resolved structurally by storing `cnt_a` and `cnt_b`; pick at query time.
+4. **Sub-5s backgrounds** (3,504) — likely OS noise. Not debounced, deliberately.
+5. **Dedup intervals within a bucket before emitting deltas (§7.4)** — **implemented**; a
+   gaps-and-islands merge makes the delta and count tables consistent by construction.
+   Without it: **+9.54%** inflation (verified — it produced 618 mismatches before the fix).
+6. **`WITH FILL` on every `avg` query (§7.5)** — sparse dimension combinations have missing
+   minutes. `max` is unaffected.
+7. **User-level vs session-level concurrency.** 10,866 sessions vs 9,618 users; 61 users have
+   17,397 overlapping session pairs. Likely a separate benchmark question.
+8. **Open-session validation.** Simulated 16:30 cutoff ⇒ **3,532 sessions open**. The
+   provided file has zero unclosed sessions and cannot exercise this path.
+9. **Country is degenerate** (1 value). Keep in the ordering key for schema stability.
+10. **Day-spanning sessions** (16 sessions, max 43 hrs) — confirm they survive partition
+    pruning. Mitigated by partitioning on `session_start_epoch`, verified constant per session.
+11. **`jap` / `jpn`** — both Japanese, 1,760 rows, not merged by the normalisation rule.
 
 ---
 

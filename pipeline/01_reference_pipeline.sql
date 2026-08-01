@@ -3,7 +3,10 @@
 -- Mirrors the ClickHouse medallion model 1:1. Used to generate ground truth
 -- for diffing against the ClickHouse implementation.
 -- ============================================================================
-SET VARIABLE gap_ms = 90000;   -- heartbeat timeout
+-- Heartbeat timeout, EMPIRICALLY DERIVED (not guessed):
+--   (a) gap histogram collapses 137x at 50s  (40-50s: 100,934 gaps -> 50-60s: 737)
+--   (b) P(gap contains a real AppBackgrounded) jumps 0.5% -> 50.6% at exactly 50s
+SET VARIABLE gap_ms = 50000;
 
 -- ================= BRONZE : exact mirror of source ==========================
 CREATE OR REPLACE TABLE bronze_events AS
@@ -62,9 +65,13 @@ UNION ALL
 SELECT session_id, ts_ms, 1 FROM g
   WHERE prev IS NOT NULL AND ts_ms - prev > getvariable('gap_ms');
 
--- 3b. explicit transitions, per definition (D1 ignores pause, D2 honours it)
+-- 3b. explicit transitions, per definition
+--   FG  = FOREGROUND-ONLY  (PRIMARY). Pause is an ACTIVE state: the user is present,
+--         the app is in the foreground, the stream is held open. Only background and
+--         heartbeat-silence break the interval.
+--   ENG = ENGAGED-VIEWING  (secondary/diagnostic). Also excludes pause.
 CREATE OR REPLACE TABLE raw_transitions AS
-SELECT 'D1' AS defn, session_id, ts_ms,
+SELECT 'FG' AS defn, session_id, ts_ms,
        CASE WHEN signal='SESSION_CLOSE' THEN -1
             WHEN signal='SESSION_OPEN'  THEN 1
             WHEN event_type='AppBackgrounded' THEN 0
@@ -73,19 +80,19 @@ SELECT 'D1' AS defn, session_id, ts_ms,
 FROM silver_events
 WHERE signal<>'LIVENESS' AND (event_type IN ('AppBackgrounded','AppForegrounded') OR signal IN ('SESSION_OPEN','SESSION_CLOSE') OR event='Play')
 UNION ALL
-SELECT 'D2', session_id, ts_ms,
+SELECT 'ENG', session_id, ts_ms,
        CASE WHEN signal='SESSION_CLOSE' THEN -1
             WHEN signal='SESSION_OPEN'  THEN 1
             WHEN signal='STATE_ACTIVE'  THEN 1
             WHEN signal='STATE_INACTIVE' THEN 0 END
 FROM silver_events WHERE signal<>'LIVENESS'
-UNION ALL SELECT 'D1', session_id, ts_ms, st FROM gap_transitions
-UNION ALL SELECT 'D2', session_id, ts_ms, st FROM gap_transitions;
+UNION ALL SELECT 'FG', session_id, ts_ms, st FROM gap_transitions
+UNION ALL SELECT 'ENG', session_id, ts_ms, st FROM gap_transitions;
 
 -- 3c. watermark close for sessions with no SESSION_CLOSE (open sessions)
 CREATE OR REPLACE TABLE watermark_close AS
 SELECT d.defn, s.session_id, s.last_seen_ms + getvariable('gap_ms') AS ts_ms, -1 AS st
-FROM silver_session_dim s CROSS JOIN (SELECT 'D1' defn UNION ALL SELECT 'D2') d
+FROM silver_session_dim s CROSS JOIN (SELECT 'FG' defn UNION ALL SELECT 'ENG') d
 WHERE s.has_close = 0;
 
 -- ================= SILVER 4 : ACTIVE INTERVALS (the state machine) =========

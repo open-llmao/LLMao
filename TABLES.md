@@ -322,7 +322,7 @@ ORDER BY session_id;
 `live_minutes` is bounded by session **duration**, not chattiness — the 1,803-event session
 contributes at most `duration_minutes` entries.
 
-### S4 · `silver_active_intervals` — 35,954 rows ◀ the state machine
+### S4 · `silver_active_intervals` — 27,251 rows (`FG`) ◀ the state machine
 
 All conditions applied here. Populated by a **refreshable MV** (needs whole-session context),
 processing only sessions whose `last_seen` moved since the last refresh.
@@ -330,7 +330,7 @@ processing only sessions whose `last_seen` moved since the last refresh.
 | Column | Type | Note |
 |---|---|---|
 | `session_id` | `FixedString(32)` | |
-| `defn` | `Enum8('D1'=1,'D2'=2,'D3'=3)` | **all three definitions coexist** |
+| `defn` | `Enum8('FG'=1,'ENG'=2)` | **`FG` = primary (pause ACTIVE) · `ENG` = engagement diagnostic** |
 | `start_ms` / `end_ms` | `DateTime64(3)` | |
 | `platform` / `country` / `video_type` / `content_id` / `category` | dims | denormalised |
 | `is_open` | `UInt8` | 1 = provisional close at watermark |
@@ -345,30 +345,33 @@ ORDER BY (session_id, defn, start_ms);
 
 **The complete condition set:**
 
-| # | Condition | Trigger | Cost if applied |
-|---|---|---|---:|
-| 1 | Session opens | `SESSION_OPEN` | — |
-| 2 | Session closes | `SESSION_CLOSE` | — |
-| 3 | Backgrounded | `AppBackgrounded` | **−915 hrs** |
-| 4 | Foregrounded | `AppForegrounded` | — |
-| 5 | Paused | `pause` (D2/D3 only) | **−159 hrs** |
-| 6 | Resumed | `resume` / `Play` | — |
-| 7 | Buffering | `BufferStart` (D3 only) | −10 hrs |
-| 8 | **Heartbeat gap > 90s** | gap in `live_minutes` | inferred background |
-| 9 | **Idempotency** | drop transition == previous | prevents cumsum drift |
-| 10 | Watermark close | `last_seen + 90s` and no `SESSION_CLOSE` | open sessions |
+| # | Condition | Trigger | Effect under `FG` |
+|---|---|---|---|
+| 1 | Session opens | `SESSION_OPEN` | → ACTIVE |
+| 2 | Session closes | `SESSION_CLOSE` | terminal |
+| 3 | **Backgrounded** | `AppBackgrounded` | **→ INACTIVE (−915 hrs)** |
+| 4 | Foregrounded | `AppForegrounded` | → ACTIVE |
+| 5 | **Heartbeat gap > 50s** | gap in `live_minutes` | **→ INACTIVE** |
+| 6 | Heartbeat returns | gap closes | → ACTIVE |
+| 7 | **Idempotency** | drop transition == previous | prevents cumsum drift |
+| 8 | Watermark close | `last_seen + 50s`, no `SESSION_CLOSE` | provisional close |
+| — | `pause` / `resume` | | **NO CHANGE — stays ACTIVE** |
+| — | `BufferStart` / `BufferEnd` | | **NO CHANGE — stays ACTIVE** |
+| — | `speed-*`, `Ad*`, `Seek` | | **NO CHANGE** |
 
-| `defn` | Excludes | Active hrs | **Peak** |
-|---|---|---:|---:|
-| `D1` | background | 2,061.7 | **2,657** |
-| `D2` | background + pause | 1,902.9 | **2,427** |
-| `D3` | + buffering | 1,876.8 | **2,411** |
+> **Only two things end presence: background and silence.** A paused or buffering viewer still
+> holds a player slot, a CDN connection and an ad-impression opportunity — they are concurrent.
 
-> Condition 9 is one `arrayFilter` line and it is **not optional** — 109 `BG→BG` and 45
+| `defn` | `pause` | Excludes | Intervals | Active hrs | **Peak** | **Avg** |
+|---|---|---|---:|---:|---:|---:|
+| **`FG` (primary)** | **ACTIVE** | background, silence | 27,251 | **2,007.8** | **2,958** | **36.2** |
+| `ENG` (diagnostic) | inactive | + pause | 37,545 | 1,857.2 | 2,844 | 35.3 |
+
+> Condition 7 is one `arrayFilter` line and it is **not optional** — 109 `BG→BG` and 45
 > `FG→FG` pairs produce unbalanced deltas, and because concurrency is a cumulative sum, one
 > unbalanced delta corrupts **every subsequent minute permanently**.
 
-### S5 · `silver_session_minutes` — 136,924 rows
+### S5 · `silver_session_minutes` — 140,434 rows (`FG`)
 
 Explodes each interval to the minutes it covers, **deduplicated per session-minute**.
 
@@ -394,7 +397,7 @@ ORDER BY (minute, defn, session_id);
 
 ## 4. GOLD — three tables
 
-### G1 · `gold_concurrency_minute` — 90,511 rows ◀ primary serving table
+### G1 · `gold_concurrency_minute` — 93,007 rows (`FG`) ◀ primary serving table
 
 **The measurement that changes the design.** Aggregating the exploded minutes to
 `(minute × dimensions)` collapses them almost completely:
@@ -415,7 +418,7 @@ for per-session-per-minute rows, and false once you aggregate to dimension grain
 | `country` | `LowCardinality(String)` | 1 |
 | `video_type` | `Enum8` | 2 |
 | `content_id` | `UInt32` | 3,357 |
-| `defn` | `Enum8` | 3 |
+| `defn` | `Enum8` | 2 |
 | `cnt_a` | `SimpleAggregateFunction(sum, UInt32)` | Definition A |
 | `cnt_b` | `SimpleAggregateFunction(sum, UInt32)` | Definition B |
 
@@ -444,12 +447,12 @@ SELECT max(c) AS peak, avg(c) AS avg_conc, argMax(minute, c) AS peak_minute
 FROM (
     SELECT minute, sum(cnt_b) AS c
     FROM gold_concurrency_minute
-    WHERE defn = 'D2' AND minute BETWEEN {from} AND {to} AND platform = {p}
+    WHERE defn = 'FG' AND minute BETWEEN {from} AND {to} AND platform = {p}
     GROUP BY minute
 );
 ```
 
-### G2 · `gold_concurrency_delta` — 71,908 rows
+### G2 · `gold_concurrency_delta` — 21,647 rows (`FG`)
 
 Kept **alongside** G1, not instead of it. Deltas are update-friendly; counts are query-friendly.
 
@@ -499,13 +502,13 @@ problem statement asks for.
 | 🥈 | `silver_events` | 905,558 | 100% |
 | 🥈 | `silver_session_dim` | 10,866 | 1.2% |
 | 🥈 | `silver_session_timeline` | 10,866 | 1.2% |
-| 🥈 | **`silver_active_intervals`** | **35,954** | **4.0%** |
-| 🥈 | `silver_session_minutes` | 136,924 | 15.1% |
-| 🥇 | **`gold_concurrency_minute`** | **90,511** | **10.0%** |
-| 🥇 | `gold_concurrency_delta` | 71,908 | 7.9% |
+| 🥈 | **`silver_active_intervals`** | **27,251** | **3.0%** |
+| 🥈 | `silver_session_minutes` | 140,434 | 15.5% |
+| 🥇 | **`gold_concurrency_minute`** | **93,007** | **10.3%** |
+| 🥇 | `gold_concurrency_delta` | 21,647 | 2.4% |
 | 🥇 | `gold_concurrency_hour` | ~62 | 0.007% |
 
-**Serving layer is 10% of raw**, and it grows with *minutes × observed dimension combos* —
+**Serving layer is 10.3% of raw**, and it grows with *minutes × observed dimension combos* —
 not with session count. Ten million sessions in one minute still produce ~25 rows.
 
 ---
@@ -514,9 +517,10 @@ not with session count. Ten million sessions in one minute still produce ~25 row
 
 1. **`jap` / `jpn` alias** — both Japanese, 1,760 rows, not merged by the normalisation rule.
 2. **`FixedString(32)` vs `cityHash64`** for IDs — 2x vs 8x saving; recommend lossless.
-3. **90-second gap threshold** — anchored on measured cadence (p50 30s / p90 40s) but
-   **unvalidated**. Sweep 60/90/120.
-4. **`defn` triples every silver/gold row.** If the benchmark pins one definition, drop the
-   others and reclaim 3x.
+3. **50-second gap threshold — empirically derived**, not guessed: the gap histogram
+   collapses 137x at 50s, and P(gap contains a real `AppBackgrounded`) jumps 0.5% → 50.6% at
+   the same point. Sensitivity across 45s→180s is **0.6%**.
+4. **`defn` doubles every silver/gold row.** `ENG` is a diagnostic; drop it to reclaim 2x if
+   engagement reporting isn't needed.
 5. **`country` has 1 value.** Keep in the ordering key for schema stability; it costs ~nothing
    under `LowCardinality` and avoids a migration if the unseen day adds markets.

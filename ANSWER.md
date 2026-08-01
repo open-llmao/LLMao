@@ -13,14 +13,17 @@
 BRONZE (2 tables, exact mirror)      SILVER (decides active)          GOLD (serves)
 ─────────────────────────────        ────────────────────────         ──────────────
 bronze_events      905,558  ──┐   silver_events        901,348   ┌─► gold_concurrency_minute
-bronze_content      33,464  ──┴─►  silver_session_dim   10,866   │        89,042  ◀ primary
+bronze_content      33,464  ──┴─►  silver_session_dim   10,866   │        93,007  ◀ primary
                                    silver_session_timeline       │
-                                   silver_active_intervals 36,597├─► gold_concurrency_delta
-                                   silver_session_minutes 134,487│        36,217  ◀ hot path
+                                   silver_active_intervals 27,251├─► gold_concurrency_delta
+                                   silver_session_minutes 140,434│        21,647  ◀ hot path
                                    silver_merged_runs            └─► gold_concurrency_hour
 ```
 
-**Serving layer = 9.8% of raw.** Queries never touch bronze or silver.
+**Serving layer = 10.3% of raw.** Queries never touch bronze or silver.
+
+> **Primary definition: `FG` (foreground-only). Pause counts as ACTIVE.**
+> **Peak = 2,958 · Avg = 36.2 · Peak minute = 2026-07-26 16:26 IST.**
 
 ---
 
@@ -34,8 +37,9 @@ watching.
 
 ```
  SESSION ALIVE   ████████████████████████████████████████████  2,976.9 hrs
- ACTIVE (D2)     ██████████░░░░░░░░████████████░░░░██████████  1,902.9 hrs (64%)
-                           ▲ background       ▲ pause
+ ACTIVE (FG)     ██████████████████░░░░░░░░██████████████████  2,007.8 hrs (67%)
+                                   ▲ backgrounded / silent
+                 pause is INSIDE the active band — still a concurrent viewer
 ```
 
 ### The complete condition set
@@ -45,22 +49,23 @@ watching.
 | A1 | Session opens | `VideoSessionStart` | `event_type` | 10,880 | → ACTIVE |
 | A2 | Returns to foreground | `AppForegrounded` | `event_type` | 14,321 | → ACTIVE |
 | A3 | Playback begins | `Play` | `event` | 10,883 | → ACTIVE |
-| A4 | Resumes | `resume` | `event` ⚠ | 31,780 | → ACTIVE |
-| A5 | Speed resume | `speed-resume` | `event` ⚠ | 380 | → ACTIVE |
-| A6 | Ad resume | `AdResume` | `event` ⚠ | 27 | → ACTIVE |
+| — | Resumes | `resume` | `event` ⚠ | 31,780 | **→ NO CHANGE (already ACTIVE)** |
+| — | Speed resume | `speed-resume` | `event` ⚠ | 380 | **→ NO CHANGE** |
+| — | Ad resume | `AdResume` | `event` ⚠ | 27 | **→ NO CHANGE** |
 | A7 | **Heartbeat returns** | gap closes | derived | — | → ACTIVE |
 | I1 | **Backgrounded** | `AppBackgrounded` | `event_type` | 14,700 | → INACTIVE |
-| I2 | **Paused** | `pause` | `event` ⚠ | 27,340 | → INACTIVE |
-| I3 | **Heartbeat missing** | gap > 90s | derived | — | → INACTIVE |
-| I4 | Speed pause | `speed-pause` | `event` ⚠ | 380 | → INACTIVE |
-| I5 | Ad pause | `AdPause` | `event` ⚠ | 45 | → INACTIVE |
+| — | **Paused** | `pause` | `event` ⚠ | 27,340 | **→ NO CHANGE (stays ACTIVE)** |
+| I3 | **Heartbeat missing** | gap > 50s | derived | — | → INACTIVE |
+| — | Speed pause | `speed-pause` | `event` ⚠ | 380 | **→ NO CHANGE** |
+| — | Ad pause | `AdPause` | `event` ⚠ | 45 | **→ NO CHANGE** |
 | T1 | Session closes | `VideoSessionEnd` | `event_type` | 10,881 | TERMINAL |
-| T2 | **Watermark** | `last_seen + 90s` | derived | — | provisional close |
+| T2 | **Watermark** | `last_seen + 50s` | derived | — | provisional close |
 | — | Everything else (33 events) | | | 783,941 | **no state change** |
 
-⚠ **Six of these are hidden inside `event_type='VideoHeartbeat'`.** `pause` and `resume` are
-not their own event types — they are `event` values. Driving the state machine off
-`event_type` silently misses 59,952 state changes.
+⚠ = hidden inside `event_type='VideoHeartbeat'` — `pause`/`resume` are `event` values, not
+their own `event_type`. **Under the foreground-only definition these no longer drive state**,
+but you still must read `event` (not `event_type`) to classify them correctly, and to build
+the ENG diagnostic view.
 
 ### Answering the three cases the question names
 
@@ -78,29 +83,59 @@ pairing is dirty and must be handled idempotently:
 Skipping idempotency emits unbalanced `±1`, and since concurrency is a cumulative sum, one
 unbalanced delta corrupts **every subsequent minute permanently**.
 
-**"the heartbeat is missing"** — measured cadence is **p50 30s / p90 40s** (not the documented
-60s; heartbeats arrive in same-millisecond bursts, so 843,600 rows collapse to 632,449 real
-pulses). Timeout set at **90s ≈ 3 missed beats**. A gap injects a synthetic INACTIVE at
-`last_seen + 90s` and an ACTIVE when beats resume.
+**"the heartbeat is missing"** — silence is the *only* inference signal, and the threshold is
+**empirically derived at 50s**, not guessed:
 
-**"the player is paused"** — this one is genuinely ambiguous, and the data explains why:
+*(a) The gap histogram collapses 137x at 50s:*
 
-| State | Heartbeats fire? | Rows |
+| Gap bucket | Count |
+|---|---:|
+| 40–50s | **100,934** ← real cadence |
+| 50–60s | **737** ← 137x collapse |
+
+*(b) Validated against labelled `AppBackgrounded` events — P(gap contains a real background)
+jumps 100x at exactly the same point:*
+
+| Gap length | P(contains real background) |
+|---|---:|
+| 40–50s | **0.5%** |
+| 50–60s | **50.6%** |
+| 300s+ | 72.9% |
+
+Two independent signals agree on 50s. **Sensitivity is low** — sweeping 45s→180s moves peak
+by only 17 sessions (0.6%), because 77% of long gaps are already explained by an explicit
+`AppBackgrounded` (62%) or the session had ended. Gap inference is a *safety net* for the
+1,943 cases where the background event was lost — worth ~1.0% of peak.
+
+**"the player is paused"** — **pause is an ACTIVE state for concurrency.**
+
+A paused viewer is still a concurrent viewer: the app is in the foreground, the session holds
+its player slot, the CDN connection and the ad/capacity footprint are all still there. Pause is
+a *playback* state, not a *presence* state, and concurrency measures presence.
+
+The data supports this independently — **heartbeats do not stop during pause**:
+
+| Player state | Heartbeats fire? | Rows |
 |---|---|---:|
 | Playing | yes | 748,527 |
 | **Paused** | **YES — 94,590** | 33,768 session-minutes |
-| Backgrounded | no (boundary only) | 4,475 |
+| Backgrounded | no (boundary artifacts only) | 4,475 |
 
-**Heartbeats do not stop during pause.** So "heartbeat-missing" cannot detect pause, and a
-session-independent model is *structurally blind* to it. That means the problem statement's
-own two criteria disagree, so we ship both:
+The client keeps reporting because the session is genuinely still alive. Silence means
+*gone*; pause does not. This also matches the problem statement's correctness criterion
+verbatim — *"excludes backgrounded and heartbeat-missing periods"* — which names background
+and silence, and **not** pause.
 
-| Definition | Excludes | Intervals | **Peak** | **Avg** |
-|---|---|---:|---:|---:|
-| **D1** | background, gaps | 25,883 | **2,969** | 36.3 |
-| **D2** | background, gaps, pause | 36,597 | **2,833** | 36.7 |
+So the primary definition treats `pause` / `resume` / `speed-pause` / `AdPause` as **liveness
+signals with no state change**.
 
-Selected at query time via `WHERE defn = 'D1'|'D2'`. **A 4.8% swing — not worth guessing.**
+| Definition | `pause` | Intervals | **Peak** | **Avg** | Active hrs |
+|---|---|---:|---:|---:|---:|
+| **`FG` — foreground-only (PRIMARY)** | **ACTIVE** | 27,251 | **2,958** | **36.2** | 2,007.8 |
+| `ENG` — engaged-viewing (diagnostic) | inactive | 37,545 | 2,844 | 35.3 | 1,857.2 |
+
+`ENG` is retained as a **secondary metric**, not a competing answer — it measures *engaged*
+viewing (useful for content teams), while `FG` measures *concurrency* (capacity, ads, scale).
 
 ### Evaluation order (order matters)
 
@@ -111,7 +146,7 @@ Selected at query time via `WHERE defn = 'D1'|'D2'`. **A 4.8% swing — not wort
 4  Merge both sources, re-sort onto one timeline
 5  Collapse consecutive duplicate states       ← fixes BG→BG, FG→FG
 6  Terminate at VideoSessionEnd, never reopen  ← 134 sessions end backgrounded
-7  No close? provisional close at last_seen+90s, is_open=1
+7  No close? provisional close at last_seen+50s, is_open=1
 8  Emit [start,end) for each ACTIVE run
 9  Drop zero-length intervals
 10 Merge runs inside the same minute bucket    ← prevents +9.54% double-count
@@ -127,10 +162,10 @@ the primary serving layer, minute deltas for the hot/open-session path.**
 | Representation | Rows | Verdict |
 |---|---:|---|
 | Interval arrays per session | 10,866 arrays | ✅ used *inside* silver — enables the state machine under ClickHouse's block-scoped MV limit |
-| **Normalised intervals** | **36,597** | ✅ **source of truth** — 3.37/session, audit trail, identity queries |
-| **Pre-aggregated minute deltas** | **36,217** | ✅ **hot path** — O(1) writes, update-friendly |
-| **Minute occupancy counts** | **89,042** | ✅ **primary serving** — no cumsum needed |
-| Per-session-per-minute rows | 134,487 | ❌ intermediate only, never served |
+| **Normalised intervals** | **27,251** | ✅ **source of truth** — 2.51/session, audit trail, identity queries |
+| **Pre-aggregated minute deltas** | **21,647** | ✅ **hot path** — O(1) writes, update-friendly |
+| **Minute occupancy counts** | **93,007** | ✅ **primary serving** — no cumsum needed |
+| Per-session-per-minute rows | 140,434 | ❌ intermediate only, never served |
 
 ### The measurement that decides it
 
@@ -138,8 +173,8 @@ The problem statement warns per-minute explosion is "prohibitively large." **Tha
 per-session-minute rows and false once aggregated to dimension grain:**
 
 ```
- session-minutes exploded    134,487
- → aggregated to dim grain    89,042   ◀ only 2.5x the delta table
+ session-minutes exploded    140,434
+ → aggregated to dim grain    93,007   ◀ collapses to dimension cardinality
 ```
 
 Measured: **24.6 dimension-combos active per minute**, 1.51 sessions per cell. So storing
@@ -149,7 +184,7 @@ actual counts is affordable — and it removes the cumulative sum from the query
 
 | | Counts (G1) | Deltas (G2) |
 |---|---|---|
-| Rows | 89,042 | 36,217 |
+| Rows | 93,007 | 21,647 |
 | Write per interval | O(duration) | **O(1)** |
 | Query | `max`/`avg` — trivial | cumsum + `WITH FILL` |
 | Extend open session | rewrite range | **append 1 row** |
@@ -164,9 +199,9 @@ The two representations are reconciled **by construction** — deltas are derive
 deduped minute table via a gaps-and-islands merge, not from raw intervals:
 
 ```
- minutes compared   D1: 1,320    D2: 1,411
- MISMATCHES         D1: 0        D2: 0
- max difference     D1: 0        D2: 0
+ minutes compared   FG: 1,322    ENG: 1,426
+ MISMATCHES         FG: 0        ENG: 0
+ max difference     FG: 0        ENG: 0
 ```
 
 > **This check found a real bug.** The first implementation derived deltas straight from
@@ -186,7 +221,7 @@ SELECT max(c)                AS peak_concurrency,
 FROM (
     SELECT minute, sum(cnt_b) AS c
     FROM gold_concurrency_minute
-    WHERE defn = 'D2'
+    WHERE defn = 'FG'                      -- pause counts as active
       AND minute BETWEEN {from} AND {to}
       AND platform = {platform}          -- any dimension filter
     GROUP BY minute
@@ -197,8 +232,8 @@ FROM (
 
 | Query | Rows read | vs raw |
 |---|---:|---:|
-| Global peak | 89,042 | **10.2x less** |
-| Filtered peak (`platform='SONY_ANDROID_TV'`) | **9,354** | **97x less** |
+| Global peak | 93,007 | **9.7x less** |
+| Filtered peak (`platform='SONY_ANDROID_TV'`) | **~9,400** | **~96x less** |
 | Raw scan (avoided) | 905,558 | — |
 
 Latency on the filtered peak is **~30 ms**, and that is process startup — the query itself
@@ -211,33 +246,36 @@ reads 9,354 rows.
 Peak is `max` over the reconstructed per-minute curve — never a stored max, never a sum.
 Confirmed on real data:
 
-| defn | **Peak** | **Avg** | Peak minute |
+| Definition | **Peak** | **Avg** | Peak minute |
 |---|---:|---:|---|
-| D1 | 2,969 | 36.3 | 2026-07-26 16:26 |
-| D2 | **2,833** | **36.7** | 2026-07-26 16:26 |
+| **`FG` (primary)** | **2,958** | **36.2** | **2026-07-26 16:26** |
+| `ENG` (diagnostic) | 2,844 | 35.3 | 2026-07-26 16:26 |
+| *naive (no exclusion)* | *3,543* | — | *16:27* |
+
+**Naive overstates peak by 19.8% and picks the wrong minute.**
 
 > *"a dimension like platform and a content might peak at one minute, while platform + country
 > might peak at an entirely different minute"*
 
-**Confirmed — peaks spread across a 13-minute window:**
+**Confirmed — peaks spread across a 14-minute window (16:18 → 16:32):**
 
 | Platform | Peak | Peak minute |
 |---|---:|---|
-| **ALL** | **2,833** | **16:26** |
-| ANDROID_PHONE | 1,744 | 16:26 |
-| IPHONE | 351 | **16:25** |
-| SONY_ANDROID_TV | 332 | **16:32** |
-| JIO_ANDROID_TV | 225 | **16:27** |
-| Mweb | 69 | **16:32** |
-| SAMSUNG_HTML_TV | 55 | 16:26 |
-| ANDROID_TAB | 41 | 16:26 |
-| XIAOMI_ANDROID_TV | 40 | **16:19** |
-| FIRE_TV | 39 | **16:29** |
-| LG_HTML_TV | 24 | **16:25** |
+| **ALL** | **2,958** | **16:26** |
+| ANDROID_PHONE | 1,813 | 16:26 |
+| IPHONE | 376 | **16:25** |
+| SONY_ANDROID_TV | 343 | **16:32** |
+| JIO_ANDROID_TV | 227 | **16:27** |
+| Mweb | 71 | **16:32** |
+| SAMSUNG_HTML_TV | 60 | **16:18** |
+| XIAOMI_ANDROID_TV | 44 | **16:20** |
+| ANDROID_TAB | 42 | 16:26 |
+| FIRE_TV | 40 | **16:29** |
+| LG_HTML_TV | 23 | **16:30** |
 
 ```
- Σ per-platform peaks   2,920
- true global peak       2,833      ◀ the sum OVERSTATES by 87 (+3.1%)
+ Σ per-platform peaks   3,039
+ true global peak       2,958      ◀ the sum OVERSTATES by 81 (+2.7%)
 ```
 
 **Therefore `max()` can never be pre-aggregated per dimension.** The serving table stores
@@ -265,7 +303,7 @@ ascending cardinality, so the cheapest prefix prunes first.
 ENGINE = SummingMergeTree
 PARTITION BY toYYYYMM(minute)
 ORDER BY (defn, country, video_type, platform, content_id, minute);
---         3      1        2           10        3,357      3,686
+--         2      1        2           10        3,357      3,686
 ```
 
 | Dimension | Distinct | Type | Bytes |
@@ -282,8 +320,8 @@ ORDER BY (defn, country, video_type, platform, content_id, minute);
 Rolling the full-grain table up to `(minute, platform)` versus counting directly:
 
 ```
- cells compared    D1: 5,334    D2: 5,075
- MISMATCHES        D1: 0        D2: 0
+ cells compared    FG: 5,334    ENG: 5,075
+ MISMATCHES        FG: 0        ENG: 0
 ```
 
 This holds because each session is pinned by `argMin(dim, event_ts)` to exactly **one**
@@ -320,7 +358,7 @@ sequenceDiagram
     Q-->>T: query now → counted as active ✅
     K->>S: heartbeat 16:20:50
     S->>T: (end=16:20:50, is_open=1, v=3) — extends
-    Note over S,T: silence > 90s → watermark fires
+    Note over S,T: silence > 50s → watermark fires
     S->>T: (end=16:22:20, is_open=1, v=4) — timeout close
     K->>S: VideoSessionEnd 16:27:59 (late)
     S->>T: (end=16:27:59, is_open=0, v=5) — FINAL
@@ -359,7 +397,7 @@ design that only works on the closed-session file will fail on the unseen day.
 SELECT min(c) FROM (/* curve */);   -- must be >= 0
 ```
 
-Result: **D1 = 0, D2 = 0** ✅. A negative value means the state machine emitted an unbalanced
+Result: **FG = 0, ENG = 0** ✅. A negative value means the state machine emitted an unbalanced
 `−1` and every subsequent minute is wrong.
 
 ---
@@ -368,7 +406,7 @@ Result: **D1 = 0, D2 = 0** ✅. A negative value means the state machine emitted
 
 | Check | Result |
 |---|---|
-| Delta table vs count table, minute-for-minute | **0 mismatches** (D1, D2) |
+| Delta table vs count table, minute-for-minute | **0 mismatches** (FG, ENG) |
 | Dimension additivity (roll-up vs direct) | **0 mismatches**, 10,409 cells |
 | Negative-concurrency guard | **min = 0** both definitions |
 | Content join coverage | **100%** — 0 orphan `content_id` |
@@ -382,8 +420,8 @@ Result: **D1 = 0, D2 = 0** ✅. A negative value means the state machine emitted
 | Layer | Rows | Grows with |
 |---|---:|---|
 | bronze | 905,558 | events — **linear** |
-| `silver_active_intervals` | 36,597 | sessions × 3.37 — **linear, 4%** |
-| **`gold_concurrency_minute`** | **89,042** | **minutes × observed dim combos — saturating** |
+| `silver_active_intervals` | 27,251 | sessions × 2.51 — **linear, 3%** |
+| **`gold_concurrency_minute`** | **93,007** | **minutes × observed dim combos — saturating** |
 
 Gold does **not** grow with session count. Ten million sessions in one minute still produce
 ~25 rows, because deltas and counts from different sessions land in the same
@@ -394,10 +432,18 @@ new *dimension combinations* appear — bounded by the content catalog, not by t
 
 ## Known-open items
 
-1. **90-second gap threshold** — anchored on measured cadence (p50 30s / p90 40s) but not
-   validated against ground truth. Sweep 60/90/120 when the benchmark lands.
-2. **D1 vs D2** — 4.8% swing; both shipped, selected by `defn`.
-3. **Sub-5s backgrounds** (3,504 of them) — likely OS noise. Not debounced, deliberately.
+1. **Definition is now settled: `FG` (pause = ACTIVE) is primary.** A paused viewer holds a
+   player slot, a CDN connection and an ad impression opportunity — they are concurrent.
+   `ENG` remains materialised as a secondary engagement metric.
+2. **50s heartbeat threshold** — empirically derived from two independent signals (histogram
+   cliff + labelled-background validation). Sensitivity measured at **0.6%** across
+   45s→180s, so this is now a low-risk parameter.
+3. **Sub-5s backgrounds** (3,504) — likely OS noise (notification shade, transient focus
+   loss). Not debounced, deliberately: the literal reading is what the ground truth most
+   likely implements. Worth a sensitivity check if peak reads low.
 4. **`jap` / `jpn`** — both Japanese, 1,760 rows, not merged by the normalisation rule.
-5. **Definition A (boundary-instant)** — the pipeline currently materialises Definition B
-   (any-overlap). `cnt_a` is specified in `TABLES.md` but not yet populated.
+5. **Definition A (boundary-instant) bucketing** — the pipeline materialises Definition B
+   (any-overlap in minute). `cnt_a` is specified in `TABLES.md` but not yet populated; this
+   remains the largest open ambiguity (~18% on the old baseline).
+6. **`VideoError`** — classified as LIVENESS. 81% precede `VideoSessionEnd`, but 55 sessions
+   continue after one, so treating it as terminal would truncate them.
