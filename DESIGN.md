@@ -33,7 +33,7 @@ are 1:1 copies of their own name. Inside that heartbeat bucket, only **7.1% of r
 state-bearing** (`pause`/`resume`/`speed-*`/`Ad*`); the other 92.9% are pure liveness signal.
 Collapse the pair into a single 5-value `signal` enum at ingest (§3.4).
 
-**Two decisions determine correctness** (§6):
+**Three decisions determine correctness** (§6):
 
 - *"Concurrent at minute M" is ambiguous and it's an 18% swing* — boundary-instant gives
   2,427, any-overlap-in-minute gives 2,871, on identical data. Store both delta encodings
@@ -41,11 +41,19 @@ Collapse the pair into a single 5-value `signal` enum at ingest (§3.4).
 - *Peaks are not additive.* Per-platform peaks land at different minutes (16:19 → 16:32) and
   sum to 2,959 > the overall peak of 2,871. You cannot pre-aggregate `max()`; the serving
   table must hold minute-grain counts per dimension combination.
+- *What counts as "active" is a third axis, 9.5% wide* — excluding only background gives
+  **2,657**; also excluding pause gives **2,427**. The problem statement supports both
+  readings. Combined with the bucketing axis, the answer space spans **2,411 → 2,871 (19%)**.
+
+**Correction to an earlier draft (§2.3):** heartbeats **continue during pause** (94,590 of
+them) and only stop during background. So heartbeat-silence and `AppBackgrounded` are *not*
+two views of the same truth — the session-independent model is structurally blind to pause.
+The two models are complements, not cross-checks.
 
 **The cheap win:** active intervals are only **3.31 rows per session**. Store intervals or
 their ±1 deltas — never per-minute rows per session. That's a ~100x storage difference.
 
-**Kafka: 3 topics** (§8) — one raw ingest topic keyed by `video_session_id` with 12
+**Kafka: 3 topics** (§9) — one raw ingest topic keyed by `video_session_id` with 12
 partitions, one compacted interval-output topic, one DLQ. Content metadata is a ClickHouse
 dictionary, not a stream. Do not split topics by event type: it breaks the per-session
 ordering the state machine depends on, and trap #1 means it wouldn't cleanly separate the
@@ -138,18 +146,37 @@ Building the state machine off `event_type` silently retains **304 hours** of pa
 > **Rule: dedup to distinct `(session_id, timestamp)` before any gap analysis. Derive the
 > gap timeout from the measured ~30–40s cadence, not from the 60s in the docs.**
 
-### 2.3 Heartbeats stop during background — a free cross-check
+### 2.3 Heartbeats stop during background — but NOT during pause
 
-Only **4,499 of 843,600** heartbeats occur while the app is backgrounded, and those are
-boundary artifacts. Heartbeat silence and `AppBackgrounded` are two independent signals for
-the same truth.
+> ⚠ **Corrected.** An earlier draft of this document claimed heartbeat-silence and
+> `AppBackgrounded` were "two independent signals for the same truth." **That is wrong**, and
+> the error matters. The measurement below is the correct one.
 
-This is exactly the **session-aware vs session-independent** comparison the README asks for:
+Heartbeat behaviour by state:
 
-- *Session-aware:* reconstruct intervals from explicit BG/FG + pause/resume transitions.
-- *Session-independent:* mark a `(session, minute)` active purely if a heartbeat landed in it.
+| Player state | Heartbeats fire? | Heartbeat rows | Distinct session-minutes |
+|---|---|---:|---:|
+| Playing | Yes | 748,527 | — |
+| **Paused** | **YES** | **94,590** | **33,768** |
+| Backgrounded | No — boundary artifacts only | 4,475 | 3,021 |
 
-If the two disagree by more than a few percent, one of them has a bug. Build both.
+```
+ BACKGROUND  ─────────────────  heartbeats STOP     ✅ silence detects it
+ PAUSE       ─────────────────  heartbeats CONTINUE ❌ silence CANNOT detect it
+```
+
+**Consequence: the session-independent (heartbeat-only) model is structurally incapable of
+detecting pause.** The two models do not measure the same thing:
+
+| Model | Actually measures | Sees background? | Sees pause? |
+|---|---|---|---|
+| Session-independent (heartbeat gaps) | *"app in foreground"* | ✅ | ❌ |
+| Session-aware (state machine) | *"app in foreground **AND** playing"* | ✅ | ✅ |
+
+They are **complements, not cross-checks**. They differ by exactly the pause time —
+33,768 session-minutes. Build both, as the README asks, but do not expect them to agree, and
+do not treat agreement as a correctness signal. The only thing heartbeat-silence validates is
+the background half of the state machine.
 
 ### 2.4 BG/FG events are explicitly unreliable — and the data proves it
 
@@ -196,7 +223,7 @@ Background durations (`BG → FG`):
 
 **3,504 backgrounds are under 5 seconds** — likely OS noise (notification shade, transient
 focus loss) rather than "stopped watching". Whether to debounce these is an open call
-(§9): I would *not* debounce by default, since the literal reading is what the ground truth
+(§10): I would *not* debounce by default, since the literal reading is what the ground truth
 most likely implements, but it moves ~3,500 intervals and deserves a sensitivity check.
 
 The 424,057 figure means you need an explicit **default-state assumption** after
@@ -338,7 +365,79 @@ multiIf(
 > A buffering user is still present and still watching; they just have bad network. Treating
 > buffering as inactive would cut concurrency further. I do not believe the ground truth does
 > this, but it is the most debatable line in the taxonomy and deserves a sensitivity check
-> alongside the heartbeat timeout (§9 item 2).
+> alongside the heartbeat timeout (§10 item 2).
+
+---
+
+### 3.5 Complete active/inactive classification — all 47 events
+
+Every event, with a verdict. Classification was validated **behaviourally**, not by intuition:
+for each event I measured the probability that it is followed by `AppBackgrounded` within 30s.
+
+| Event | n | P(→ background ≤30s) | Verdict |
+|---|---:|---:|---|
+| **`pause`** | 27,340 | **26.6%** | **→ INACTIVE** |
+| `BufferStart` | 66,641 | 0.1% | LIVENESS |
+| `BufferEnd` | 66,289 | 0.3% | LIVENESS |
+| `video_forward` | 49,879 | 0.0% | LIVENESS |
+| `Seek` | 32,036 | 0.0% | LIVENESS |
+| `resume` | 31,780 | 0.5% | → ACTIVE |
+| `video_rewind` | 6,587 | 0.3% | LIVENESS |
+| `AdSkipTrueView` | 1,889 | 0.3% | LIVENESS |
+| `network-change` | 1,178 | 0.5% | LIVENESS |
+| `download_asset_played` | 1,154 | 0.0% | LIVENESS |
+| `next_video_click` | 619 | 0.2% | LIVENESS |
+| all others | — | ≤0.5% | LIVENESS |
+
+**`pause` is the only event in the dataset that predicts disengagement.** At 26.6% it is
+two orders of magnitude above every other event. Everything else sits in the noise floor —
+those users are present and watching.
+
+#### Lifecycle & state events (the 6 non-heartbeat types)
+
+| Event | Class | Effect | n |
+|---|---|---|---:|
+| `VideoSessionStart` | **OPEN** | begin session, state = ACTIVE | 10,880 |
+| `VideoSessionEnd` | **CLOSE** | terminal — close interval and session | 10,881 |
+| `AppForegrounded` | **→ ACTIVE** | opens interval | 14,321 |
+| `AppBackgrounded` | **→ INACTIVE** | closes interval | 14,700 |
+| `Play` | **→ ACTIVE** | opens interval | 10,883 |
+| `VideoError` | **LIVENESS** ⚠ | *not* terminal — see below | 293 |
+
+> **`VideoError` is not a session terminator.** 238 of 293 (81%) are immediately followed by
+> `VideoSessionEnd` within 5s — but **55 sessions keep playing after one**. Treating it as
+> terminal truncates those 55 sessions early. Let the real `VideoSessionEnd` close them.
+
+#### State-bearing events inside `VideoHeartbeat`
+
+**→ INACTIVE**
+
+| Event | n | Hours if treated inactive | Verdict |
+|---|---:|---:|---|
+| `pause` | 27,340 | **125–304** | ✅ the only one that matters |
+| `speed-pause` | 380 | 0.22 | ⚠ artifact — see below |
+| `AdPause` | 45 | 0.13 | ✅ correct but negligible |
+| `BufferStart` | 66,641 | 10.11 | ❌ recommend ACTIVE |
+
+**→ ACTIVE:** `resume` (31,780) · `speed-resume` (380) · `AdResume` (27) · `BufferEnd` (66,289)
+
+**LIVENESS — 33 events, no state change:** `network-activity`, `buffer-health`,
+`video-resize`, `video_forward`, `Seek`, `network-bandwidth`, `upshift`, `downshift`,
+`dropped-frames`, `video_rewind`, `network-change`, `AdSkipTrueView`, all `download_*`,
+`chromecast_*`, `go_live_click`, `golive`, `next_video_click`, `audio-language`,
+`subtitle-language`, `speed-change`, `preroll-disabled`, `video_quality_change`,
+`preview_watched`, `AdClick`, `AdBufferStart/End`, `premium_button_click`.
+
+#### Two classification calls worth defending
+
+**`speed-pause` / `speed-resume` are an artifact, not a pause.** 252 of 380 are immediately
+followed by `speed-resume` with **median gap 0.00 s** — it is a playback-speed implementation
+detail, not user disengagement. Total cost either way: 0.22 hrs out of 1,903. Noise.
+
+**`BufferStart` / `BufferEnd` should count as ACTIVE.** A buffering user is present, in the
+foreground, and waiting to watch — they have bad network, not absent attention. Median
+`BufferStart → BufferEnd` is **0.0 s**, total 10.11 hrs (0.5% of active time). Excluding it
+moves peak concurrency by only 16 sessions (2,427 → 2,411).
 
 ---
 
@@ -639,7 +738,7 @@ information gain. **Store intervals (or their ±1 deltas), never per-minute rows
 
 ---
 
-## 6. The two decisions that determine correctness
+## 6. The three decisions that determine correctness
 
 ### 6.1 "Concurrent at minute M" is ambiguous — an 18% swing
 
@@ -728,9 +827,197 @@ Only `sum`-like measures (watch time) decompose cleanly; `max` never does.
 
 ---
 
-## 7. Target architecture
+### 6.3 What counts as "active" — a third axis, 9.5% wide
 
-### 7.1 Pipeline
+The `pause` classification is not settled by the problem statement. Three defensible
+definitions, all measured:
+
+| Definition | Excludes | Active hrs | **Peak** | vs naive |
+|---|---|---:|---:|---:|
+| **Naive** | nothing | 2,976.9 | **3,543** | — |
+| **D1 — foreground-only** | background | 2,061.7 | **2,657** | −25% |
+| **D2 — foreground + playing** | background, pause | 1,902.9 | **2,427** | −31% |
+| **D3 — D2 + buffering** | + buffering | 1,876.8 | **2,411** | −32% |
+
+```
+ naive  3,543  ████████████████████████████████████
+ D1     2,657  ███████████████████████████            ← literal "foreground-only"
+ D2     2,427  ████████████████████████               ← current pick
+ D3     2,411  ████████████████████████
+```
+
+**The problem statement supports both D1 and D2, in different places:**
+
+| Reads as D1 | Reads as D2 |
+|---|---|
+| Title: *"foreground-only concurrency"* | *"How do you define an active interval when the heartbeat is missing, **the player is paused**, or the app is backgrounded?"* |
+| *"Concurrency excludes backgrounded and heartbeat-missing periods"* — **pause not mentioned** | |
+| *"Foreground-only means foreground-only"* | |
+
+The D1 reading is strengthened by §2.3: **heartbeats do not stop during pause**, so
+"heartbeat-missing" cannot be the mechanism by which pause is excluded. If the ground truth
+was generated from heartbeat gaps plus background events, it is D1.
+
+**The full ambiguity space:**
+
+```
+ concurrency definition (A / B)  ×  active definition (D1 / D2 / D3)  =  6 answers
+ spanning 2,411 → 2,871 — a 19% spread on identical input data
+```
+
+> **Design response: both axes must be runtime flags, not build-time constants.** Store
+> `delta_a`/`delta_b` for the bucketing axis, and either materialise D1 and D2 interval sets
+> or carry a `pause_excluded` flag on the interval rows. Answering all six costs far less than
+> guessing wrong on one.
+
+---
+
+## 7. The delta model in depth
+
+### 7.1 The core identity
+
+An interval `[s, e)` becomes two events: `+1` when it starts, `−1` when it ends. Then
+
+```
+concurrency(m) = Σ delta(b)   for all buckets b ≤ m
+```
+
+Every `+1` is eventually cancelled by its `−1`, so the running sum at minute *m* equals
+exactly the number of intervals started-but-not-yet-ended. It telescopes.
+
+```
+ SESSION   TIMELINE (minutes 0-6)        DELTAS
+ ─────────────────────────────────────────────────────
+   A       ●━━━━━━━━━━━━●                +1@0   −1@3
+   B            ●━━━━━━━━━━━━━●          +1@1   −1@4
+   C            ●━━━●                    +1@1   −1@2
+   D                    ●━━━━━━━━━●      +1@3   −1@6
+
+ minute:      0    1    2    3    4    5    6
+ Σdelta:     +1   +2   −1  −1+1   −1    0   −1
+             ──────────────────────────────────
+ CUMSUM:      1    3    2    2    1    1    0   ◀ concurrency
+                   ▲ peak = 3
+```
+
+Three sessions overlap at minute 1, and the model found it **without ever comparing sessions
+to each other**. No range join, no per-minute explosion.
+
+### 7.2 Why not the alternatives
+
+| Approach | Rows here | At 100x | Query cost |
+|---|---:|---:|---|
+| Per-minute explosion | 136,924 | 13.7M | scan all |
+| Range self-join `s < m AND e > m` | 35,954 | 3.6M | **O(n·m)** — collapses |
+| **Delta + cumsum** | **71,908** | **7.2M** | **O(minutes in range)** |
+
+The delta table grows with distinct **(minute × dimension)** combinations, not with sessions.
+Ten million sessions in one minute still produce one row per dimension combo.
+
+### 7.3 Edge case — 40% of intervals vanish under Definition A
+
+| | |
+|---|---:|
+| Intervals shorter than 1 minute | **18,991** (53%) |
+| Intervals starting **and** ending in the same minute | **14,310** (40%) |
+
+An interval 16:00:30 → 16:00:45 emits `+1@16:00` and `−1@16:00` — **net zero. It disappears.**
+This is the mechanism behind the A-vs-B gap (2,427 vs 2,871).
+
+```
+ DEF A (boundary instant)   +1 @ bucket(s)   −1 @ bucket(e)
+ DEF B (any overlap)        +1 @ bucket(s)   −1 @ bucket(e)+1   ◀ shifted one bucket
+```
+
+Cost of storing both: one extra `Int32` column. Removes an 18% guess.
+
+### 7.4 Edge case — the 9.54% double-count bug
+
+A session can hold **two active intervals inside the same minute** (pause and resume within
+60 s). Under Definition B it is then counted twice.
+
+```
+ session-minutes, naive:    149,992
+ session-minutes, deduped:  136,924
+ INFLATION:                  13,068   =   +9.54%
+```
+
+**Fix:** merge intervals separated by less than one bucket *before* emitting deltas (cheap, do
+it in the array step of §8.3), or make Definition B count `uniqExact(session_id)` per minute
+instead of summing deltas.
+
+### 7.5 Edge case — missing minutes break `avg`, not `max`
+
+Minutes containing no interval boundary produce **no delta row at all**. Already visible in
+this dataset: `FIRE_TV` has no rows in 2 of 60 minutes, `LG_HTML_TV` in 1. At
+`platform + content_id` granularity, most minutes will be missing.
+
+- `max()` — **safe**. A missing minute is never the peak.
+- `avg()` — **WRONG**. It averages only the minutes that exist, inflating the result.
+
+**Fix — `WITH FILL`:**
+
+```sql
+SELECT minute, sum(sumMerge(delta_a)) OVER (ORDER BY minute) AS concurrency
+FROM concurrency_minute_agg
+WHERE minute >= {from} AND minute < {to} AND platform = {p}
+GROUP BY minute
+ORDER BY minute WITH FILL FROM {from} TO {to} STEP INTERVAL 1 MINUTE
+```
+
+`WITH FILL` emits gap minutes with `delta = 0` so the running total carries forward and `avg`
+sees the full denominator.
+
+### 7.6 Edge case — filter before cumsum, always
+
+```
+ ✗  cumsum over everything, then filter   →  excluded sessions' ±1 already baked in
+ ✓  filter, then cumsum                   →  correct
+```
+
+This is *why* the serving table is ordered `(platform, country, video_type, content_id,
+minute)` — dimensions first, so the filter prunes before the window function runs.
+
+### 7.7 Late arrivals and open sessions are free
+
+The model's best property. A late interval simply inserts `+1/−1` at past minutes; the next
+cumsum picks it up. **No rebuild, no rescan.**
+
+```
+ OPEN SESSION:   +1 @ start, no −1 yet     → stays counted (correct — still watching)
+ WATERMARK:      provisional −1 @ last_beat + 90s
+ REAL END:       supersede via version; −1 moves to the true minute
+```
+
+### 7.8 The negative guard
+
+An unbalanced `−1` — from the `BG→BG` idempotency bug (§2.4) — makes the cumsum drift
+**permanently**. Every subsequent minute is wrong, not just one. Assert it:
+
+```sql
+SELECT min(concurrency) FROM ( /* curve query */ )   -- must be >= 0
+```
+
+Cheap, and it catches the nastiest failure mode in the whole design.
+
+### 7.9 What deltas cannot do
+
+Deltas give **counts, not identities**. *"Which sessions were concurrent at 16:26?"* requires
+a range query against the interval table:
+
+```sql
+SELECT video_session_id FROM session_intervals
+WHERE start_ms < '2026-07-26 16:27:00' AND end_ms > '2026-07-26 16:26:00'
+```
+
+Keep `session_intervals` — it is only 4% of raw, and it is the audit trail for when a judge
+asks *"prove this number."*
+
+---
+
+## 8. Target architecture
+
+### 8.1 Pipeline
 
 ```mermaid
 flowchart TD
@@ -749,7 +1036,7 @@ flowchart TD
     CM -.-> CS
 ```
 
-### 7.2 Data volume at each stage
+### 8.2 Data volume at each stage
 
 The whole design rests on the collapse between stage 3 and stage 4.
 
@@ -771,7 +1058,7 @@ Contrast with the per-minute-explosion approach the problem statement warns abou
 every session into one row per active minute would produce ~1.9M rows here (1,903 active
 hours × 60), and **190M at 100x** — vs ~36K intervals. That is the ~100x factor.
 
-### 7.3 Table sketches
+### 8.3 Table sketches
 
 ```sql
 -- ③ intervals: the compact truth. ~3.3 rows per session.
@@ -853,7 +1140,7 @@ the session-aware model. The README explicitly asks for the comparison.
 
 ---
 
-## 8. How many Kafka streams?
+## 9. How many Kafka streams?
 
 ### Answer: **3 topics** (2 mandatory + 1 dead-letter). Not more.
 
@@ -956,30 +1243,41 @@ and directly satisfies the tooling requirement.
 
 ---
 
-## 9. Open questions / next steps
+## 10. Open questions / next steps
 
 1. **Pin down the concurrency definition (§6.1).** Highest-leverage unknown — 18% swing.
    Look for the benchmark query set; it may drop later. Until then, build both.
-2. **Heartbeat-timeout sensitivity sweep.** Test 60s / 90s / 120s and measure peak movement.
-   Second-biggest correctness risk. Measured cadence is p50 30s / p90 40s, so 90s (≈3 missed
-   beats) is the likely sweet spot — but verify.
-3. **User-level vs session-level concurrency.** 10,866 sessions vs 9,618 users ⇒ multi-session
+2. **Pin down the active definition (§6.3).** Second highest — 9.5% swing between D1
+   (background only) and D2 (background + pause). Materialise both; do not pick one.
+3. **Heartbeat-timeout sensitivity sweep.** Test 60s / 90s / 120s and measure peak movement.
+   Measured cadence is p50 30s / p90 40s, so 90s (≈3 missed beats) is the likely sweet spot —
+   but it is currently an unvalidated guess.
+4. **Sub-5-second background debounce.** 3,504 backgrounds are under 5s — likely OS noise
+   (notification shade, transient focus loss). Recommend *not* debouncing by default, since
+   the literal reading is what the ground truth most likely implements, but measure it.
+5. **Dedup intervals within a bucket before emitting Definition-B deltas (§7.4).** Currently
+   a **+9.54%** inflation bug if missed.
+6. **Add `WITH FILL` to every `avg` query (§7.5).** Sparse dimension combinations have
+   missing minutes; `avg` over existing rows only is silently wrong. `max` is unaffected.
+7. **User-level vs session-level concurrency.** 10,866 sessions vs 9,618 users ⇒ multi-session
    users exist. The data dictionary says *"user-level concurrency will be derived from this
    ID"* — likely a separate benchmark question. Cheap to add if the Kafka key is `user_id`.
-4. **Open-session validation.** Truncate the file at 16:30 and confirm the pipeline resolves
+8. **Open-session validation.** Truncate the file at 16:30 and confirm the pipeline resolves
    the curve. The provided file has zero open sessions and will not exercise this path.
-5. **Country dimension is currently degenerate** (1 value). The unseen day may add more —
+9. **Country dimension is currently degenerate** (1 value). The unseen day may add more —
    keep it in the ordering key, but don't tune against it.
-6. **Test the day-spanning sessions.** Max session is 43 hrs. Confirm they aren't dropped by
-   date-partition pruning.
+10. **Test the day-spanning sessions.** Max session is 43 hrs. Confirm they aren't dropped by
+    date-partition pruning.
+11. **`VideoError` handling (§3.5).** 81% precede `VideoSessionEnd`, but 55 sessions continue
+    after one. Classified as LIVENESS — verify against ground truth if peak looks low.
 
 ---
 
-## 10. Reproducing the numbers
+## 11. Reproducing the numbers
 
 ```bash
 brew install git-lfs duckdb
-git lfs install --local && git lfs pull --include="SonyLiv/data/*"
+git lfs install --local && git lfs pull --include="data/*"
 ```
 
 All figures above come from DuckDB over the raw CSV. The state machine prototype is ~40 lines
