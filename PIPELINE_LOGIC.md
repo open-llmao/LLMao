@@ -60,12 +60,61 @@ This is the hard part, in three steps:
 
 **Step A — Build a "profile" for each viewing session.** For every person's session, we build one summary: when did they start, when did we last hear from them, did they ever background the app, did they ever close it. A session's data trickles in over minutes as they keep watching, so instead of waiting for the whole session to end, we update this summary a little bit *every time new data arrives* — like adding a new line to someone's diary each day instead of writing the whole diary at the end. This happens instantly, no waiting.
 
+> **Not every part of this "profile" is a single number — and that distinction is what makes Step B possible.**
+>
+> | What it stores | How it's kept | Collapses to... |
+> |---|---|---|
+> | "When did they start?" | `min` | one single number |
+> | "When did we last hear from them?" | `max` | one single number |
+> | "Did they ever close the app?" | `max` of a yes/no flag | one single number |
+> | **Every foreground/background/close signal, in order** | `groupArrayIf` | **a whole list — nothing thrown away** |
+> | **Every single heartbeat timestamp** | `groupUniqArray` | **a whole list — nothing thrown away** |
+>
+> So the profile isn't just 3 summary numbers — it's **3 summary numbers plus 2 full lists**. Those two lists are what let Step B reconstruct exactly how many separate watching stretches happened, instead of just "when did they last do something."
+
 **Step B — Turn that profile into "active time ranges."** Given everything we know about this person, when were they *actually* watching (not paused-and-forgotten, not backgrounded)? Rules we use:
 - Backgrounded the app → not watching, until they come back.
 - Haven't heard from them (no "I'm still here" signal) for more than **50 seconds** → assume they wandered off.
 - Paused the video but the app is still open and pinging us → **still counts as watching**. Someone who pauses to answer the door is still "in the room."
 
 This step needs to look at a person's *entire* history at once, so instead of updating instantly, it re-checks everything every **15 seconds**. That's the one place in this whole pipeline with a small delay — everywhere else is instant.
+
+> **A worked example — how it "knows" this was 2 separate stretches, not 1.**
+>
+> Say a session actually did this:
+> ```
+> 5:01:00pm  session starts                  (explicit signal → ACTIVE)
+> 5:02:00pm  heartbeat
+> 5:03:00pm  heartbeat
+> 5:10:00pm  backgrounded                    (explicit signal → INACTIVE)
+> 5:10:05pm  foregrounded again              (explicit signal → ACTIVE)
+> 5:11:00pm  heartbeat
+> 5:14:00pm  heartbeat
+>               ...then nothing for 8 minutes...
+> 5:22:00pm  heartbeat resumes
+> 5:23:00pm  heartbeat
+> ```
+> Step A's profile for this session stores:
+> - the list of explicit signals: `[5:01:00→ACTIVE, 5:10:00→INACTIVE, 5:10:05→ACTIVE]`
+> - the list of every heartbeat: `[5:01:00, 5:02:00, 5:03:00, 5:11:00, 5:14:00, 5:22:00, 5:23:00]`
+>
+> Step B's worker then:
+> 1. **Takes the explicit signals as-is.**
+> 2. **Scans the heartbeat list for gaps over 50 seconds.** Finds one: `5:14:00 → 5:22:00` is an 8-minute gap. Manufactures two fake signals: `5:14:50→INACTIVE` (50 seconds after the last heartbeat) and `5:22:00→ACTIVE` (when they came back).
+> 3. **Merges everything into one sorted timeline:**
+>    ```
+>    5:01:00 → ACTIVE
+>    5:10:00 → INACTIVE
+>    5:10:05 → ACTIVE
+>    5:14:50 → INACTIVE   (fake/gap-inferred — treated identically to a real signal)
+>    5:22:00 → ACTIVE
+>    ```
+> 4. **Walks through that timeline and pairs up every ACTIVE-to-INACTIVE flip.** Each pair becomes one row:
+>    - `[5:01:00 → 5:10:00)` — one row
+>    - `[5:10:05 → 5:14:50)` — a second row
+>    - `[5:22:00 → ...)` — a third row, still open (handled by Step C below)
+>
+> **This is how it "knows"** — it isn't calculating a count from a formula. It's walking through the full, ordered list of every state change (real and gap-inferred) and creating a new row every time the state flips from "watching" to "not watching." Two separate ACTIVE stretches means two flips means two rows — that falls out of the walk-through automatically, no special-casing needed. This is also exactly why `min`/`max` alone would never have been enough: `max(last_seen)` only tells you the very last timestamp — it throws away the fact that there was a gap in the middle at all.
 
 > **Which tables, exactly, and what happens in them:**
 > - **Input:** `silver_session_state_current` — just a **VIEW** (stores nothing), the finished profile from Step A, read live.
@@ -89,10 +138,61 @@ This step needs to look at a person's *entire* history at once, so instead of up
 > Every profile has a flag, `has_close`, that's `0` if we never actually saw an explicit "closed the app" signal. For any profile where `has_close = 0`, the worker manufactures one extra fake marker: *"treat this person as closed, 50 seconds after the last time we heard from them."* That fake marker goes through the exact same merge-and-pair-up steps from Step B (steps 3–6 above), so it behaves identically to a real "closed" signal — it just becomes the end of that person's last watching stretch. The resulting row in `silver_active_intervals` also gets flagged `is_open = 1`, so anyone reading the table knows this is a best guess, not a confirmed closure.
 >
 > **The self-correcting part:** because this whole thing reruns every 15 seconds, if that person's app *does* send more data later — a late heartbeat, or the actual "closed" signal finally arrives — their "last seen" time updates, the fake close marker automatically moves forward to match, the version number goes up, and `ReplacingMergeTree` swaps in the corrected row on the next refresh. Nobody has to notice the mistake or fix it by hand.
+>
+> **A worked example — watching the guess get corrected in real time.**
+> ```
+> 5:00:00pm  session starts        (explicit signal → ACTIVE)
+> 5:01:00pm  heartbeat
+> 5:02:00pm  heartbeat
+> 5:03:00pm  heartbeat
+> ...every minute, like clockwork...
+> 5:08:00pm  heartbeat  ← the last thing we EVER hear from this person.
+>                           Phone died, app crashed, lost signal — we don't know
+>                           why, and no "backgrounded" signal, no "closed the app"
+>                           signal, nothing. The data just stops.
+> ```
+> **Why Step B's own gap-detection can't catch this by itself:** Step B looks for silence by comparing *pairs* of heartbeats — "was there more than 50 seconds between this one and the next one?" But there's no "next one" after 5:08:00. There's nothing to pair it with. Step B is structurally blind to the *tail end* of a session — that's precisely the hole Step C exists to plug.
+>
+> **What happens, cycle by cycle:**
+> - **First refresh after 5:08:00.** `has_close = 0`, so Step C manufactures one fake signal at `5:08:50pm` (50 seconds after the last heartbeat). Row: `[5:00:00 → 5:08:50)`, `is_open = 1` — "our best guess, not confirmed."
+> - **Every 15-second refresh after that, with nothing new arriving:** the calculation reruns, produces the *identical* row and version number, `ReplacingMergeTree` keeps just the one copy. No change, no waste.
+> - **3 minutes later, a delayed heartbeat from `5:11:00pm` finally arrives** (phone briefly reconnected). "Last heard from them" moves to `5:11:00`. Next cycle, Step C fires again with a *new* fake signal at `5:11:50pm`. Row becomes `[5:00:00 → 5:11:50)` with a bigger version number — `ReplacingMergeTree` swaps out the stale row for this corrected one.
+> - **A few minutes after that, the real "session closed" signal finally arrives** (queued somewhere, delayed in transit) — timestamped `5:15:00pm`. `has_close` becomes `1`. Step C doesn't fire at all this time; the real signal is used instead. Final row: `[5:00:00 → 5:15:00)`, `is_open = 0` — no longer a guess, confirmed.
+>
+> The "provisional close" isn't a one-shot guess we're stuck with — it's a placeholder that keeps getting corrected, for free, every 15 seconds, for as long as it takes for the truth to catch up.
 
 ### Station 3: Gold (the final numbers)
 
 Now that we know exactly when each person was really watching, we can answer "how many people were watching at any given minute" almost instantly, without re-checking every single person's history each time someone asks.
+
+> **A worked example — the same two numbers, calculated two different ways.**
+>
+> Say two people watched:
+> ```
+> Person A: 5:01:00pm → 5:04:00pm   (3 minutes, continuous)
+> Person B: 5:02:30pm → 5:03:10pm   (a brief 40-second peek, mid-stream)
+> ```
+>
+> **G1 — direct headcount per minute.** For every minute, G1 asks two slightly different questions: *"who was here for the entire minute?"* (this is `cnt_a`, concurrency) and *"who was here for any part of the minute, even a few seconds?"* (this is `cnt_b`, reach).
+>
+> | Minute | Fully inside it? (`cnt_a`) | Touches it at all? (`cnt_b`) |
+> |---|---|---|
+> | 5:01–5:02 | A | A |
+> | 5:02–5:03 | A | A **and B** (B started at 5:02:30, mid-minute) |
+> | 5:03–5:04 | A | A **and B** (B was still there until 5:03:10) |
+>
+> Notice: **B never shows up in the "fully inside" column at all** — B's whole visit was only 40 seconds, never a complete minute — but B *does* show up in the "touched it" column for both minutes they brushed against. This is exactly why we keep both numbers: `cnt_a` answers "how many concurrent viewers," `cnt_b` answers "how many distinct people passed through at all." Mechanically: each interval gets expanded into the list of minutes it covers (or touches), then for each minute we count how many *distinct* people show up in that list.
+>
+> **G2 — the door-counter version of the same thing.** Instead of asking "who's here right now" minute by minute, G2 just records two events per person — one tap when they arrive, one tap when they leave — and adds up all the taps in time order:
+> ```
+> 5:01:00  A arrives   → +1
+> 5:02:30  B arrives   → +1
+> 5:03:10  B leaves    → -1
+> 5:04:00  A leaves    → -1
+> ```
+> Running tally, in order: `+1, +1, -1, -1` → the tally goes **1 → 2 → 1 → 0**. Read off at any point: 1 person from 5:01–5:02:30, 2 people from 5:02:30–5:03:10, back to 1 from 5:03:10–5:04:00. That matches G1's `cnt_b` picture exactly (2 people touching that middle stretch) — built by a completely different method, one that never once asked "who is this."
+>
+> **Why both should agree:** if G1's minute-by-minute headcount and G2's running door-tally land on the same peak number, that's strong proof the number is actually right — two independent methods, same source data, same answer. If they *don't* agree, that's a signal something's broken, and it's much easier to notice that disagreement than it would be to notice one method quietly being wrong on its own.
 
 We build **two versions** of this answer, as a cross-check against each other:
 1. **G1** — for each minute, count how many distinct people were watching. Simple and fast.
@@ -331,14 +431,62 @@ FROM ( SELECT minute,
 
 **What it achieves.** Q2 (session-independent alternative representation, proven not just claimed), Q3 (peak still fast — one window-sum over a few thousand rows), Q5 (a session extending its active range costs G2 exactly one row-move, regardless of how long it's been open), and the explicit "compare both approaches" ask in `README_START_HERE.md` — G1 and G2 are built from the same source by construction, so any divergence between them is a real signal, not noise.
 
+### 3.3 G1 vs G2 for filtered/windowed reads — measured, not assumed
+
+A natural question: if G2 is update-friendlier (§3.2), why not just read G2 for everything, including the benchmark's "peak/avg at minute/hour/day grain, with dimension filters"? Answer, backed by `EXPLAIN` on the live instance: **G1 and G2 are equally accurate — they're designed to agree, not to compete on correctness — but G1 is dramatically cheaper for filtered range reads, and G2 is structurally incapable of avoiding that cost.**
+
+**Test: "peak concurrency, one hour, filtered to one platform."**
+
+```sql
+-- G1
+SELECT max(c) FROM ( SELECT minute, uniqExactMerge(cnt_a) AS c
+    FROM gold_concurrency_minute
+    WHERE minute BETWEEN '2026-07-26 10:00:00' AND '2026-07-26 11:00:00'
+      AND platform = 'ANDROID_PHONE'
+    GROUP BY minute );
+-- reads 61 rows.  peak = 1,600.
+
+-- G2, done NAIVELY (only summing deltas inside the window)
+SELECT max(live) FROM ( SELECT minute,
+        sum(delta) OVER (ORDER BY minute ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS live
+    FROM gold_concurrency_delta
+    WHERE delta_kind='a' AND platform='ANDROID_PHONE'
+      AND minute BETWEEN '2026-07-26 10:00:00' AND '2026-07-26 11:00:00' );
+-- peak = 1,559 — WRONG. Silently discards everyone who started watching before
+-- 10:00 and was still active during the window.
+
+-- G2, done CORRECTLY (must sum from the start of all history up to the cutoff)
+SELECT max(live) FROM ( SELECT minute,
+        sum(delta) OVER (ORDER BY minute ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS live
+    FROM gold_concurrency_delta
+    WHERE delta_kind='a' AND platform='ANDROID_PHONE'
+      AND minute <= '2026-07-26 11:00:00' )
+WHERE minute >= '2026-07-26 10:00:00';
+-- reads 5,130 rows to answer the same question. 84x more than G1.
+```
+
+**Why — `EXPLAIN indexes=1` on both, showing the actual pruning ClickHouse performs:**
+
+G1's plan shows three layers of pruning happen before any row is read:
+```
+Partition   Keys: toYYYYMM(minute)   Granules: 12/12  -- Aug partition skipped entirely
+MinMax      Keys: minute             Granules: 12/13  -- time-range filter drops blocks
+PrimaryKey  Keys: platform, minute   Granules: 8/12    -- platform is in ORDER BY, sorted on disk
+```
+This works because the filter is a **closed, two-sided range** (`BETWEEN 10am AND 11am`) — everything outside it is provably irrelevant and never touched.
+
+G2's plan has an extra step G1's never needed: `Sorting` immediately followed by `Window`. A running cumulative sum must process rows **in order, from the first one**, so there is no valid two-sided filter — the `WHERE` clause can only ever be one-sided (`minute <= cutoff`), because dropping the lower bound is exactly what produces the wrong 1,559 answer above. **The read cost isn't a badly written query — it's structural**: any correct answer from a delta model requires reading every fragment since the beginning of history, and that cost only grows as more days of data accumulate.
+
+**The one-line mechanism.** G1: each row already *is* the answer for its minute — a two-sided time filter can discard everything else, so reading is a lookup. G2: each row is only a *fragment* of the answer (a +1 or -1) — reconstructing a real number means adding up every fragment since the start, and that reconstruction can't be narrowed to just the window you care about. **This is why G1, not G2, is the one to read for the benchmark's peak/avg-at-a-grain-with-filters questions** — it's also precisely the failure mode the problem statement names when it asks for a serving layer "not recomputing overlap from raw history": an unfiltered-history-scanning G2 read is a recompute in everything but name.
+
 ---
 
 ## 4. Serving choices — when to read what
 
 | Query | Read from | Reason |
 |---|---|---|
-| Peak/avg on **closed** history, filter by dims | G1 | `uniqExactMerge` over pruned parts — correct and cheap. |
-| Peak/avg **including live open sessions** | G2 | Cumsum over deltas reflects the watermark row as soon as it's refreshed. |
+| Peak/avg, filtered, at a minute/hour/day grain — **the benchmark's own query shape** | **G1** | Two-sided time filter + `ORDER BY` prefix let ClickHouse skip whole partitions and granules — measured 61 rows read vs G2's 5,130 for the identical question (§3.3). |
+| A session that's been open a long time just got another heartbeat | Either sees it equally well after the next 15s refresh — **but writing the update is cheap in G2 (§3.2)**: 1 row moves regardless of how long the session's been open, vs G1 potentially adding many new minute-rows. | Update-friendliness is a *write*-cost question, not a read-visibility one — both reflect open sessions correctly once refreshed. |
 | Cross-model validation ("did both models agree?") | G1 + G2 | The comparison is the evaluation criterion, and both are built from the same source. |
 | Session-level drill-down ("which sessions were live at 16:04?") | `silver_active_intervals WHERE start_ms ≤ M AND end_ms > M` | Gold has no session_id (G1 only carries it as an aggregate state; G2 doesn't carry it at all). |
 | Replay from scratch (schema change) | `bronze_events_raw` | Only bronze is the source of truth. |
