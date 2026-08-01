@@ -62,10 +62,38 @@ SELECT iv.sid AS session_id, iv.a AS start_ms, iv.b AS end_ms,
 FROM iv JOIN silver_session_state s ON s.sid=iv.sid
 WHERE iv.st=1 AND iv.b IS NOT NULL AND iv.b>iv.a;
 
--- (5) gold: minute occupancy, dedup inline
+-- (5) gold: minute occupancy. BOTH bucketing definitions, side by side.
+--
+--   cnt_a = CONCURRENCY.  Session active AT the minute-boundary instant m*60s.
+--           interval [s,e) covers instant t=m*60s  iff  s <= t < e
+--           => m from ceil(s/60s) to ceil(e/60s)-1
+--           Stable under bucket size (2,599@1s -> 2,581@60s, 1.7% spread).
+--
+--   cnt_b = REACH.  Session active at ANY point inside minute m.
+--           interval [s,e) touches [m*60s,(m+1)*60s)  iff  s < (m+1)*60s AND e > m*60s
+--           => m from floor(s/60s) to floor((e-1)/60s)
+--           Inflates with bucket size (2,607@1s -> 2,958@60s -> 3,999@300s).
+--
+-- Both are DISTINCT per (session, minute) to kill the +5.14% double-count.
 CREATE OR REPLACE TABLE gold_concurrency_minute AS
-SELECT minute_id, platform, country, video_type, content_id,
-       count(DISTINCT session_id) AS cnt
-FROM (SELECT DISTINCT session_id, platform, country, video_type, content_id, m AS minute_id
-      FROM silver_active_intervals, range(start_ms//60000,(end_ms-1)//60000+1) t(m))
+WITH a AS (
+  SELECT DISTINCT session_id, platform, country, video_type, content_id, m AS minute_id
+  FROM silver_active_intervals,
+       range(CAST(ceil(start_ms/60000.0) AS BIGINT),
+             CAST(ceil(end_ms  /60000.0) AS BIGINT)) t(m)),
+b AS (
+  SELECT DISTINCT session_id, platform, country, video_type, content_id, m AS minute_id
+  FROM silver_active_intervals,
+       range(start_ms//60000, (end_ms-1)//60000 + 1) t(m))
+SELECT coalesce(a.minute_id, b.minute_id)   AS minute_id,
+       coalesce(a.platform,  b.platform)    AS platform,
+       coalesce(a.country,   b.country)     AS country,
+       coalesce(a.video_type,b.video_type)  AS video_type,
+       coalesce(a.content_id,b.content_id)  AS content_id,
+       count(a.session_id)                  AS cnt_a,
+       count(b.session_id)                  AS cnt_b
+FROM a FULL OUTER JOIN b
+  ON  a.session_id=b.session_id AND a.minute_id=b.minute_id
+  AND a.platform=b.platform AND a.country=b.country
+  AND a.video_type=b.video_type AND a.content_id=b.content_id
 GROUP BY 1,2,3,4,5;
