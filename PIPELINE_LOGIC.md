@@ -1,8 +1,8 @@
 # Pipeline Logic — SonyLIV Foreground-Only Concurrency
 
 > **Companion doc.** This file explains *every* table in the pipeline: what it does, why it exists, how it is populated, which MergeTree engine it uses (and why), and what it contributes to the overall problem.
-> **Grounds:** [`PROBLEM_STATEMENT.md`](../click-a-thon-2026/SonyLiv/PROBLEM_STATEMENT.md), [`dataset_details.md`](../click-a-thon-2026/SonyLiv/dataset_details.md).
-> **Sister docs:** `DESIGN.md` (architecture), `TABLES.md` (schema deep-dive), `ANSWER.md` (benchmark answers), `CONDITIONS.md` (active-state rules).
+> **Grounds:** [`SonyLiv/PROBLEM_STATEMENT.md`](SonyLiv/PROBLEM_STATEMENT.md), [`SonyLiv/dataset_details.md`](SonyLiv/dataset_details.md).
+> **Sister docs:** `README.md` (architecture diagram, assumptions), `pipeline/04_ddl_annotated.sql` (the exact live DDL — every `CREATE TABLE`/`CREATE MATERIALIZED VIEW` statement, one-to-one with `SHOW CREATE TABLE` on the running cloud instance, annotated inline with the same why-we-built-it-this-way reasoning as this file), `LLM_QUERY_GUIDE.md` (query templates for a conversational layer).
 
 ---
 
@@ -274,7 +274,7 @@ The evaluation criteria (from `PROBLEM_STATEMENT.md`):
 | **Correct** — foreground-only, matches ground truth | 50s gap → BG classification is empirically derived. Pause treated as ACTIVE. `uniqExact` in G1 eliminates the double-count bug that inflated peak by up to +23% in an earlier build; verified gold matches its own source (`silver_active_intervals`) exactly. |
 | **Fast** — dashboard latency with filters | Gold ORDER BY prefix `(country, video_type, platform, content_id, minute)` prunes benchmark queries to a small fraction of the table. |
 | **Update-friendly** — open sessions absorbing heartbeats | `silver_session_state` updates with **zero gap** via true incremental MV + AggregateFunction states. Intervals and gold absorb updates within a **bounded 15s window** via refreshable MVs chained with `DEPENDS ON` — never a full rebuild, never a stale gold read against a half-updated interval set. |
-| **Explained** — trade-off thinking | This file plus `TABLES.md` and `DESIGN.md`. Every engine choice justified against alternatives, including the two real ClickHouse constraints that shaped the final design: incremental MVs can't see cross-block history, and refreshable MVs don't chain into incremental MVs via ordinary INSERT semantics. |
+| **Explained** — trade-off thinking | This file plus `README.md` and `LLM_QUERY_GUIDE.md`. Every engine choice justified against alternatives, including the two real ClickHouse constraints that shaped the final design: incremental MVs can't see cross-block history, and refreshable MVs don't chain into incremental MVs via ordinary INSERT semantics. |
 | **Unseen day** — build for what you don't see | Watermark logic in `wm` CTE is dead code on this dataset (`has_close=1` for all 10,866 sessions) but load-bearing on the unseen day. Boundary-convention duality (`cnt_a`/`cnt_b`, `kind='a'`/`'b'`) hedges the private answer key. `POPULATE` on the session-state MV means the unseen day's data flows through the identical incremental path already proven on this dataset. |
 
 ---
@@ -309,4 +309,4 @@ These are documented here because every one of them **failed silently** — no e
 
 ---
 
-*Every design decision here has been checked against the DuckDB reference oracle (`pipeline/01_reference_pipeline.sql`) which byte-matches the 5-object build on gold (93,007 rows, peak cnt_a=2,581, cnt_b=2,958). The cloud pipeline is now fully MV-driven, zero manual INSERTs, and gold is verified correct relative to its own upstream source; a residual ~3% gap vs the oracle traces to an interval-count difference (25,149 vs 27,251) still open for investigation.*
+*Every design decision here has been checked against the DuckDB reference oracle (`pipeline/01_reference_pipeline.sql`) which byte-matches the 5-object build on gold (93,007 rows, peak cnt_a=2,581, cnt_b=2,958). The cloud pipeline is now fully MV-driven, zero manual INSERTs, and gold is verified correct relative to its own upstream source; a residual ~3% gap vs the oracle traces to an interval-count difference (25,149 vs 27,251) still open for investigation. The exact DDL for every table described in this file lives in `pipeline/04_ddl_annotated.sql`.*
