@@ -10,14 +10,35 @@
 
 ## 0. Layer contract
 
-| Layer | Rule | Tables |
+**Final design: 5 objects.** An earlier 9-object variant was built, benchmarked and proven to
+produce **byte-identical output** (§0.8) — the extra four tables were materialised CTEs that
+cost 2.3x build time and bought zero accuracy.
+
+| Layer | Rule | Objects |
 |---|---|---|
 | **BRONZE** | Exact mirror of source. Zero logic. Never rewritten. | 2 |
-| **SILVER** | Typed, normalised, deduped, enriched. Decides active/inactive. | 5 (+2 derived) |
-| **GOLD** | Pre-aggregated serving. No session-level data. | 2 |
+| **SILVER** | Typed, normalised, deduped. Decides active/inactive. | 2 |
+| **GOLD** | Pre-aggregated serving. No session-level data. | 1 |
 
-Everything — including deltas — is computed **at table level** via MVs. No business logic
-lives in the dashboard query.
+| # | Object | Engine | Rows | Why it earns its place |
+|---|---|---|---:|---|
+| 1 | `bronze_events` | `MergeTree` | 905,558 | raw landing, replayability |
+| 2 | `bronze_content` → `dict_content` | `ReplacingMergeTree` → `DICTIONARY` | 33,464 | dimension, joined at ingest |
+| 3 | `silver_session_state` | `AggregatingMergeTree` | 10,866 | **structural** — the only way an MV can accumulate whole-session history |
+| 4 | `silver_active_intervals` | `ReplacingMergeTree(version)` | 27,251 | the truth · audit trail · identity queries |
+| 5 | `gold_concurrency_minute` | `SummingMergeTree` | 93,007 | serving layer |
+
+Everything — including the state machine and the minute counts — is computed **at table
+level** via MVs. No business logic lives in the dashboard query.
+
+**Cut from the 9-object variant** (all became inline CTEs, all provably equivalent):
+`silver_events` · `gap_transitions` · `silver_session_minutes` · `silver_merged_runs` ·
+`gold_concurrency_delta`.
+
+> `silver_events` existed partly to dedup the 13 duplicate `SessionStart` / 14 duplicate
+> `SessionEnd` rows. That is now redundant: **step 5 of the state machine (collapse
+> consecutive identical states) already absorbs them** — a second `SessionStart` maps to
+> state=1 when the state is already 1, so it collapses. One less table for free.
 
 ---
 
@@ -25,61 +46,43 @@ lives in the dashboard query.
 
 ```mermaid
 flowchart TD
-    %% ---------- SOURCES ----------
     CSV1[/"ch-hackathon-raw-data.csv<br/>905,558 rows · 232 MB"/]
     CSV2[/"ch-hackathon-content-data.csv<br/>33,464 rows · 1.2 MB"/]
 
-    %% ---------- BRONZE ----------
     subgraph BRONZE["🥉 BRONZE — exact mirror, zero logic, never rewritten"]
-        B1["<b>bronze_events</b><br/>905,558<br/>MergeTree<br/>PARTITION BY session_start_epoch<br/>ORDER BY (session_id, ts, event)"]
-        B2["<b>bronze_content</b><br/>33,464<br/>ReplacingMergeTree<br/>ORDER BY content_id"]
+        B1["<b>bronze_events</b> · 905,558<br/>MergeTree<br/>PARTITION BY session_start_epoch<br/>ORDER BY (session_id, ts, event)"]
+        B2["<b>bronze_content</b> · 33,464<br/>ReplacingMergeTree<br/>ORDER BY content_id"]
     end
     CSV1 --> B1
     CSV2 --> B2
-    B2 -->|"CREATE DICTIONARY"| DICT[("<b>dict_content</b><br/>33,464 · HASHED<br/>content_id → title,<br/>video_type, category")]
+    B2 -->|"CREATE DICTIONARY"| DICT[("<b>dict_content</b> · 33,464<br/>HASHED · content_id →<br/>video_type, category, title")]
 
-    %% ---------- SILVER ----------
-    subgraph SILVER["🥈 SILVER — typed · normalised · deduped · decides ACTIVE"]
-        S1["<b>silver_events</b><br/>901,348 &nbsp;<i>(−4,210 dupes)</i><br/>ReplacingMergeTree<br/>+ signal enum · + normalised langs"]
-        S2["<b>silver_session_dim</b><br/>10,866 &nbsp;<i>1 row / session</i><br/>AggregatingMergeTree<br/>argMin dims · last_seen · has_close"]
-        S3["<b>silver_session_timeline</b><br/>10,866<br/>AggregatingMergeTree<br/>groupArray transitions + live_minutes"]
-        S3b["<b>gap_transitions</b><br/>17,198<br/><i>derived: silence &gt; 50s</i>"]
-        S4["<b>silver_active_intervals</b><br/><b>27,251</b> &nbsp;<i>2.51 / session</i><br/>ReplacingMergeTree(version)<br/>◀ THE STATE MACHINE"]
-        S5["<b>silver_session_minutes</b><br/>140,434<br/>ReplacingMergeTree<br/><i>DEDUPED per session-minute</i>"]
-        S6["<b>silver_merged_runs</b><br/>16,279<br/><i>gaps-and-islands merge</i>"]
+    subgraph SILVER["🥈 SILVER — decides ACTIVE"]
+        S3["<b>silver_session_state</b> · 10,866<br/>AggregatingMergeTree · ORDER BY session_id<br/>─────────────<br/>argMin dims · last_seen · has_close<br/>groupArray(transitions) · groupUniqArray(live_minutes)"]
+        S4["<b>silver_active_intervals</b> · <b>27,251</b><br/>ReplacingMergeTree(version)<br/>PARTITION BY start_ms<br/>◀ THE STATE MACHINE"]
     end
 
-    B1 -->|"MV · row-level<br/>cast + normalise + derive signal"| S1
-    DICT -.->|"dictGet at ingest<br/>video_type, category, title"| S1
-    S1 -->|"MV · GROUP BY session_id<br/>argMinState / maxSimpleState"| S2
-    S1 -->|"MV · GROUP BY session_id<br/>groupArrayStateIf(signal≠LIVENESS)<br/>groupUniqArrayState(minute)"| S3
-    S1 -->|"window: lag(ts) per session<br/>WHERE gap &gt; 50s"| S3b
-    S3 -->|"REFRESHABLE MV<br/>10-step state machine"| S4
-    S3b --> S4
-    S2 -->|"dims + watermark<br/>last_seen + 50s"| S4
-    S4 -->|"explode to minutes<br/>+ DISTINCT"| S5
-    S5 -->|"contiguous-run merge<br/>row_number() islands"| S6
+    B1 -->|"MV · GROUP BY session_id<br/>inline: cast · normalise · derive signal<br/>argMinState / maxSimpleState / groupArrayState"| S3
+    DICT -.->|"dictGet at ingest<br/>video_type, category"| S3
+    S3 -->|"REFRESHABLE MV · 10-step state machine<br/><i>CTEs: gap_transitions, watermark,<br/>idempotency collapse, run merge</i>"| S4
 
-    %% ---------- GOLD ----------
-    subgraph GOLD["🥇 GOLD — pre-aggregated serving · no session-level data"]
-        G1["<b>gold_concurrency_minute</b><br/><b>93,007</b> ◀ PRIMARY<br/>SummingMergeTree<br/>cnt_a · cnt_b"]
-        G2["<b>gold_concurrency_delta</b><br/>21,647 ◀ hot path<br/>SummingMergeTree<br/>±1 deltas"]
+    subgraph GOLD["🥇 GOLD — serving"]
+        G1["<b>gold_concurrency_minute</b> · <b>93,007</b><br/>SummingMergeTree<br/>ORDER BY (country, video_type, platform,<br/>content_id, minute)<br/>cnt_a · cnt_b"]
     end
 
-    S5 -->|"MV · GROUP BY minute+dims<br/>count(DISTINCT session_id)"| G1
-    S6 -->|"MV · +1 @ run start<br/>−1 @ run end"| G2
+    S4 -->|"MV · explode to minutes + DISTINCT<br/>GROUP BY minute + dims<br/><i>CTE: session_minutes</i>"| G1
 
-    %% ---------- CONSUMERS ----------
-    G1 --> Q1["Dashboard<br/>peak · avg · curve<br/><i>+ hour/day via toStartOfHour</i>"]
-    G2 --> Q2["Live / open sessions<br/>incremental updates"]
-    S4 -.->|"identity queries<br/>+ audit trail"| Q4["<i>Which sessions were<br/>concurrent at 16:26?</i>"]
+    G1 --> Q1["Dashboard · peak · avg · curve<br/><i>hour/day via toStartOfHour()</i>"]
+    B1 -.->|"trailing ~3 min, live<br/>partition-pruned, 0.06 s"| Q2["HYBRID query<br/>gold ∪ raw tail"]
+    G1 --> Q2
+    S4 -.->|"identity + audit"| Q3["<i>Which sessions were<br/>concurrent at 16:26?</i>"]
 
     classDef bronze fill:#8B5A2B,stroke:#5C3A1C,color:#fff
     classDef silver fill:#9AA5B1,stroke:#6B7580,color:#fff
     classDef gold fill:#C9A227,stroke:#8C7016,color:#fff
     class B1,B2 bronze
-    class S1,S2,S3,S3b,S4,S5,S6 silver
-    class G1,G2 gold
+    class S3,S4 silver
+    class G1 gold
 ```
 
 ### 0.2 Row-count funnel
@@ -89,40 +92,30 @@ flowchart TD
                         │
  🥉 BRONZE   bronze_events                      905,558  ████████████████████████████  100%
              bronze_content                      33,464  █                             3.7%
-                        │  dedup (session_id, ts, event)   −4,210
- 🥈 SILVER   silver_events                      901,348  ███████████████████████████   99.5%
                         │  GROUP BY session_id
-             silver_session_dim                  10,866  ▏                             1.2%
-             silver_session_timeline             10,866  ▏                             1.2%
                         │  filter signal≠LIVENESS  (−783,941 = 86.6%)
-                        │  + gap_transitions       (+17,198)
-                        │  ▼ 10-STEP STATE MACHINE
+ 🥈 SILVER   silver_session_state                10,866  ▏                             1.2%
+                        │      11.2 transitions + 12.3 live_minutes per session
+                        │  ▼ 10-STEP STATE MACHINE  (+17,198 gap transitions inline)
              silver_active_intervals             27,251  ▉                             3.0%
-                        │  explode to minutes + DISTINCT
-             silver_session_minutes             140,434  ████                          15.5%
-                        │  contiguous-run merge
-             silver_merged_runs                  16,279  ▌                             1.8%
+                        │  explode → 140,434 session-minutes (CTE, never stored)
                         │  GROUP BY minute + dims
  🥇 GOLD     gold_concurrency_minute             93,007  ██▉                           10.3%
-             gold_concurrency_delta              21,647  ▋                             2.4%
 ```
 
-### 0.3 What each layer reads and produces
+**Serving layer is 10.3% of raw.** The 140,434 session-minute explosion exists only as an
+inline CTE — it is never materialised, and it collapses immediately on aggregation.
 
-| Layer | Reads from | Produces | Key transformation | Engine |
-|---|---|---|---|---|
+### 0.3 What each object reads and produces
+
+| Object | Reads from | Rows | Key transformation | Engine |
+|---|---|---:|---|---|
 | `bronze_events` | CSV / Kafka | 905,558 | **none** — raw fidelity | `MergeTree` |
 | `bronze_content` | CSV | 33,464 | **none** | `ReplacingMergeTree` |
 | `dict_content` | `bronze_content` | 33,464 | in-memory hash | `DICTIONARY` |
-| `silver_events` | `bronze_events` + `dict_content` | 901,348 | cast · normalise · **derive `signal`** · dedup | `ReplacingMergeTree` |
-| `silver_session_dim` | `silver_events` | 10,866 | `argMin` dims · `last_seen` · `has_close` | `AggregatingMergeTree` |
-| `silver_session_timeline` | `silver_events` | 10,866 | `groupArray` transitions · `groupUniqArray` minutes | `AggregatingMergeTree` |
-| `gap_transitions` | `silver_events` | 17,198 | `lag(ts)` → silence > 50s | derived |
-| **`silver_active_intervals`** | `…timeline` + `gap_transitions` + `…dim` | **27,251** | **10-step state machine** | `ReplacingMergeTree(version)` |
-| `silver_session_minutes` | `silver_active_intervals` | 140,434 | explode + `DISTINCT` (kills +9.54% dup) | `ReplacingMergeTree` |
-| `silver_merged_runs` | `silver_session_minutes` | 16,279 | gaps-and-islands merge | derived |
-| **`gold_concurrency_minute`** | `silver_session_minutes` | **93,007** | `GROUP BY minute + dims` | `SummingMergeTree` |
-| `gold_concurrency_delta` | `silver_merged_runs` | 21,647 | ±1 at run boundaries | `SummingMergeTree` |
+| **`silver_session_state`** | `bronze_events` + `dict_content` | 10,866 | cast · normalise · derive `signal` · `argMin` dims · `groupArray` transitions · `groupUniqArray` minutes | `AggregatingMergeTree` |
+| **`silver_active_intervals`** | `silver_session_state` | **27,251** | **10-step state machine** (gap inference, idempotency, watermark, run-merge — all inline) | `ReplacingMergeTree(version)` |
+| **`gold_concurrency_minute`** | `silver_active_intervals` | **93,007** | explode → `DISTINCT` → `GROUP BY minute + dims` | `SummingMergeTree` |
 
 ### 0.4 Column-level lineage — bronze → silver → gold
 
@@ -158,52 +151,114 @@ flowchart TD
 `country`, `video_type`, `category`, `minute`). Everything else is either consumed by the
 state machine or kept in silver for audit.
 
-### 0.5 Which table answers which question
+### 0.5 Which object answers which question
 
 ```
  "what actually arrived?"              ─────────────► bronze_events
- "is this event a state change?"       ─────────────► silver_events.signal
- "what are this session's dimensions?" ─────────────► silver_session_dim
- "is the session still alive?"         ─────────────► silver_session_dim.has_close / last_seen
- "was there a heartbeat gap?"          ─────────────► silver_session_timeline.live_minutes
+ "what are this session's dimensions?" ─────────────► silver_session_state (argMin cols)
+ "is the session still alive?"         ─────────────► silver_session_state.has_close / last_seen
+ "what happened, in what order?"       ─────────────► silver_session_state.transitions
+ "was there a heartbeat gap?"          ─────────────► silver_session_state.live_minutes
  "WHEN was it active?"                 ─────────────► silver_active_intervals      ◀ truth
  "WHICH sessions at minute M?"         ─────────────► silver_active_intervals      ◀ identity
  "HOW MANY concurrent at minute M?"    ─────────────► gold_concurrency_minute      ◀ serving
- "live / open-session updates"         ─────────────► gold_concurrency_delta
  "peak & avg by hour / day"            ─────────────► gold_concurrency_minute + toStartOfHour()
+ "concurrency in the last few seconds" ─────────────► HYBRID: gold ∪ raw tail  (§0.8)
 ```
 
 ### 0.6 Engine choice — every one maps to a problem-statement requirement
 
-| Table | Engine | Why this engine | Requirement it serves |
+| Object | Engine | Why this engine | Requirement it serves |
 |---|---|---|---|
 | `bronze_events` | `MergeTree` | append-only, **keeps duplicates** — if bronze dedups you can never prove what arrived | replayability |
 | `bronze_content` | `ReplacingMergeTree` | slowly-changing dim, latest wins | metadata join |
 | `dict_content` | `DICTIONARY` | in-memory hash; join at **ingest**, never at query | *"real-time join with content"* |
-| `silver_events` | `ReplacingMergeTree` | removes the 13 dup starts / 14 dup ends | correctness |
-| `silver_session_dim` | **`AggregatingMergeTree`** | `argMin`/`max` **combine incrementally** — new heartbeat = 1 small insert, no re-read | *"update-friendly at very large scale"* |
-| `silver_session_timeline` | **`AggregatingMergeTree`** | `groupArray` **accumulates across insert blocks** — the only way to give an MV whole-session context | *"absorb updates without rebuilding"* |
+| `silver_session_state` | **`AggregatingMergeTree`** | `groupArray` **accumulates across insert blocks** — the only way to give an MV whole-session context. `argMin`/`max` combine incrementally: a new heartbeat is one small insert, no re-read | *"absorb updates without rebuilding"* · *"update-friendly at very large scale"* |
 | `silver_active_intervals` | **`ReplacingMergeTree(version)`** | provisional close **superseded** by real close, by append | *"sessions still open whose ranges keep growing"* |
-| `silver_session_minutes` | `ReplacingMergeTree` | dedups session-minute — kills the **+9.54%** double-count | correctness |
 | `gold_concurrency_minute` | **`SummingMergeTree`** | counts are **additive across dimensions** (verified, 0 mismatches) so duplicate keys just fold | *"filter-friendly across dimensions"* |
-| `gold_concurrency_delta` | `SummingMergeTree` | ±1 deltas fold to a net value per key | *"pre-aggregated minute deltas"* |
 
-**The pattern:** `AggregatingMergeTree` wherever state must be *combined* incrementally,
-`ReplacingMergeTree` wherever a row must be *superseded*, `SummingMergeTree` wherever values
-are *additive*. Nothing anywhere requires a rebuild.
+**The pattern:** `AggregatingMergeTree` where state must be *combined* incrementally,
+`ReplacingMergeTree` where a row must be *superseded*, `SummingMergeTree` where values are
+*additive*. **Nothing anywhere requires a rebuild.**
 
 ### 0.7 Update paths — what happens when new data lands
 
 | Event | Touches | Cost |
 |---|---|---|
-| New heartbeat, open session | `silver_events` → `…timeline` → `…intervals` (v+1) → gold | **append only** |
+| New heartbeat, open session | `session_state` (append state) → `intervals` (v+1) → gold | **append only** |
 | Late event for a past minute | same chain; gold aggregates absorb it | **append only** |
-| `VideoSessionEnd` arrives | `…intervals` superseded by higher `version` | **append only** |
+| `VideoSessionEnd` arrives | `intervals` superseded by higher `version` | **append only** |
 | Watermark fires (`last_seen + 50s`) | provisional close row | **append only** |
 | Content metadata changes | `dict_content` reload | dictionary refresh |
 
-**No path requires a rebuild or a rescan of bronze.** `ReplacingMergeTree` collapses
-superseded rows at merge time; `SummingMergeTree` folds duplicate keys.
+**No path requires a rebuild or a rescan of bronze.**
+
+### 0.8 Why 5 objects and not 9 — measured, not argued
+
+A 9-object variant was built first, materialising `silver_events`, `gap_transitions`,
+`silver_session_minutes`, `silver_merged_runs` and `gold_concurrency_delta` as tables. Both
+pipelines were run on the full dataset and diffed.
+
+| | 9-object | 5-object |
+|---|---:|---:|
+| Peak concurrency | 2,958 | **2,958** |
+| Average concurrency | 36.2 | **36.2** |
+| Peak minute | 16:26 *(tie with 16:29)* | **16:26** *(same tie)* |
+| `silver_active_intervals` rows | 27,251 | **27,251** |
+| `gold_concurrency_minute` rows | 93,007 | **93,007** |
+| **Row-by-row gold diff** | — | **0 rows differ, either direction** |
+| **Build time** | 2.90 s | **1.26 s (2.3x faster)** |
+| Query latency | 0.03 s | 0.03 s |
+
+The gold tables are **byte-identical**: 93,007 rows each, zero rows present in one and absent
+from the other.
+
+**What actually moves the answer** — table count is not on the list:
+
+| Decision | Impact on the reported number |
+|---|---:|
+| `cnt_a` vs `cnt_b` bucketing | **14.6%** ← still open |
+| `FG` vs `ENG` (pause active?) | 3.9% ← settled: pause is ACTIVE |
+| 50s gap threshold | 0.6% ← settled, empirically derived |
+| **9 vs 5 objects** | **0.0%** |
+
+The four extra tables cost 2.3x build time and bought zero accuracy. They were materialised
+CTEs, not modelling decisions.
+
+> The 9-object pipeline is retained as `pipeline/01_reference_pipeline.sql` — it serves as the
+> **reference oracle** to diff the ClickHouse implementation against. The 5-object version
+> (`pipeline/02_five_table.sql`) is what ships.
+
+### 0.9 Freshness — the hybrid read path
+
+A refreshable MV on a 15s cadence leaves the last 15s stale. During peak ramp-up that misses
+up to **81 sessions (2.7%)**, since `VideoSessionStart` is an instantaneous signal.
+
+Fix: read **settled history from gold** and the **trailing window from raw**, in one query.
+
+```sql
+WITH wm AS (SELECT now() - INTERVAL 3 MINUTE AS w)
+SELECT max(c) FROM (
+    SELECT minute, sum(cnt_a) c FROM gold_concurrency_minute        -- settled
+    WHERE minute <= (SELECT w FROM wm) GROUP BY minute
+  UNION ALL
+    SELECT minute, count(DISTINCT session_id) c FROM ( /* state machine on raw */ )
+    WHERE minute > (SELECT w FROM wm) GROUP BY minute);
+```
+
+| Path | Latency | Peak | Freshness |
+|---|---:|---:|---|
+| Pure gold | 0.03 s | 2,958 | bounded by refresh interval |
+| **Hybrid (gold ∪ raw tail)** | **0.068 s** | **2,958** ✅ | **bounded by ingest (~5 s)** |
+| Raw tail alone @ 10x scale | 0.06 s | — | — |
+
+The tail scan stays cheap forever because partition pruning means it never touches history —
+0.06 s even on a 9.05M-row dataset.
+
+> **Caveat:** the trailing window is provisional. A session that looks active at `now()` may
+> have gone silent — you just haven't waited 50s to find out. Render the last minute as a
+> dotted line, and **run alerting on settled data only**, or a concurrency-decline alert fires
+> on every refresh.
 
 ---
 
@@ -406,54 +461,25 @@ reinterpretAsUInt128(unhex(video_session_id))   -- lossless for 32 hex chars
 
 ---
 
-## 3. SILVER — five tables
+## 3. SILVER — two objects
 
 ```
- bronze_events ──┬─► S1 silver_events        (typed, normalised, deduped, enriched)
-                 │        │
- bronze_content ─┘        ├─► S2 silver_session_dim       (1 row / session)
-   (DICTIONARY)           ├─► S3 silver_session_timeline  (arrays / session)
-                          │        │
-                          │        └─► S4 silver_active_intervals  ◀ THE STATE MACHINE
-                          │                   │
-                          └───────────────────┴─► S5 silver_session_minutes
+ silver_session_state      ← WHAT the session is + WHEN things happened, incrementally
+        │
+        ▼
+ silver_active_intervals   ← WHEN it was ACTIVE  (the state machine output)
 ```
 
-### S1 · `silver_events` — 901,348 rows
+**Cut from the 9-object variant:** `silver_events`, `gap_transitions`,
+`silver_session_minutes`, `silver_merged_runs`. All are now inline CTEs, proven equivalent
+(§0.8).
 
-Row-level transform only ⇒ a plain incremental MV works.
+### S3 · `silver_session_state` — 10,866 rows · one row per session
 
-| Column | Type | Cardinality | Role |
-|---|---|---:|---|
-| `session_id` | `FixedString(32)` | 10,866 | key |
-| `user_id` | `FixedString(32)` | 9,618 | dim |
-| `content_id` | `UInt32` | 3,357 | dim |
-| `event_ts` | `DateTime64(3)` | 641,201 | time |
-| `session_start` | `DateTime64(3)` | 10,848 | partition |
-| `signal` | `Enum8` | 5 | **state machine input** |
-| `event` | `LowCardinality(String)` | 47 | audit |
-| `event_type` | `Enum8` | 7 | audit |
-| `platform` | `LowCardinality(String)` | 10 | dim |
-| `country` | `LowCardinality(String)` | 1 | dim |
-| `video_type` | `Enum8` | 2 | dim (from dict) |
-| `category` | `LowCardinality(String)` | 84 | dim (from dict) |
-| `audio_language` | `LowCardinality(String)` | 17 | dim (normalised) |
-| `subtitle_language` | `LowCardinality(String)` | 7 | dim (normalised) |
-| `app_version` | `LowCardinality(String)` | 65 | dim |
-| `player_version` | `LowCardinality(String)` | 13 | dim |
+This single table replaces the former `silver_session_dim` + `silver_session_timeline`. Same
+key, same engine — there was never a reason to split them.
 
-```sql
-ENGINE = ReplacingMergeTree
-PARTITION BY toYYYYMMDD(session_start)
-ORDER BY (session_id, event_ts, event, signal);
-```
-
-**Dedup key = `(session_id, event_ts, event)`** — removes the 13 duplicate `VideoSessionStart`
-and 14 duplicate `VideoSessionEnd` rows.
-
-### S2 · `silver_session_dim` — 10,866 rows · one row per session
-
-#### What problem does it solve?
+#### Part A — the dimension half: what problem does it solve?
 
 The problem statement asks: *"How does the model stay **filter-friendly** across platform,
 country, content, video type?"* — and separately, *"How do you handle sessions that are
@@ -577,9 +603,7 @@ are almost certainly synthetic-data artifacts, not a real product behaviour wort
 
 ---
 
-### S3 · `silver_session_timeline` — 10,866 rows · one row per session
-
-#### What problem does it solve?
+#### Part B — the timeline half: what problem does it solve?
 
 **This table exists because of a hard ClickHouse constraint:**
 
@@ -622,38 +646,38 @@ by chattiness. The 1,803-event session contributes at most `duration_in_minutes`
 > Without the second array, a chatty session's array grows without bound. With it, memory per
 > session is bounded by wallclock — the property that makes this survive at 100x.
 
-#### Why is this separate from `silver_session_dim`?
+#### Why these live in ONE table (they used to be two)
 
-They *could* be one table. They are separate because:
+The 9-object design split these into `silver_session_dim` (scalars) and
+`silver_session_timeline` (arrays). **The split earned nothing:**
 
-| | `session_dim` | `session_timeline` |
+| | Split (9-obj) | Merged (5-obj) |
 |---|---|---|
-| Shape | scalars | arrays (~23 elements) |
-| Merge cost | cheap (`max`, `argMin`) | expensive (`groupArray` concat) |
-| Read by | interval builder, identity queries, watermark checks | **only** the state machine |
-| Refresh cadence | every insert | refreshable MV cadence |
+| Key | `session_id` | `session_id` — identical |
+| Engine | `AggregatingMergeTree` | `AggregatingMergeTree` — identical |
+| Rows | 10,866 + 10,866 | **10,866** |
+| Output | — | **byte-identical** (§0.8) |
 
-Keeping the cheap scalars separate lets the **watermark check run continuously** without
-touching the expensive arrays. That matters directly for *"sessions still open whose active
-ranges keep growing"* — you poll `last_seen` constantly and rebuild intervals only for
-sessions that actually moved.
+ClickHouse is columnar: reading `last_seen` from a merged table does **not** touch the array
+columns. The theoretical argument for splitting — *"keep the cheap watermark check away from
+the expensive arrays"* — is already satisfied by column pruning. The split only added a table
+and a join.
 
-#### Together: dim = *what*, timeline = *when in what order*
+#### Together: dims = *what*, arrays = *when in what order*
 
 ```
- silver_session_dim        "session X is ANDROID_PHONE / india / vod / content 21058030,
-                            last seen 16:27:59, has_close = 1"
-                                                   │
- silver_session_timeline   "session X went: OPEN@16:19:45 → INACTIVE@16:21:05
-                            → ACTIVE@16:25:04 → CLOSE@16:27:59
-                            and was alive in minutes {16:19..16:21, 16:25..16:27}"
-                                                   │
-                                                   ▼
+ dimension cols   "session X is ANDROID_PHONE / india / vod / content 21058030,
+                   last seen 16:27:59, has_close = 1"
+ transitions      "OPEN@16:19:45 → INACTIVE@16:21:05 → ACTIVE@16:25:04 → CLOSE@16:27:59"
+ live_minutes     "alive in minutes {16:19..16:21, 16:25..16:27}"
+                                        │
+                                        ▼
  silver_active_intervals   [16:19:45 → 16:21:05)  ANDROID_PHONE / vod / 21058030
                            [16:25:04 → 16:27:59)  ANDROID_PHONE / vod / 21058030
 ```
 
-The state machine needs **both**: the sequence to compute *when*, the dims to label *what*.
+The state machine needs **all three**: `transitions` for the sequence, `live_minutes` for gap
+inference, dimension cols to label the output.
 
 ---
 
@@ -706,31 +730,33 @@ ORDER BY (session_id, defn, start_ms);
 > `FG→FG` pairs produce unbalanced deltas, and because concurrency is a cumulative sum, one
 > unbalanced delta corrupts **every subsequent minute permanently**.
 
-### S5 · `silver_session_minutes` — 140,434 rows (`FG`)
+### ~~S5~~ · `session_minutes` — now an inline CTE, not a table
 
-Explodes each interval to the minutes it covers, **deduplicated per session-minute**.
-
-| Column | Type |
-|---|---|
-| `minute` | `DateTime` |
-| `session_id` | `FixedString(32)` |
-| `defn` | `Enum8` |
-| `covers_boundary` | `UInt8` — Definition A |
-| `covers_any` | `UInt8` — Definition B |
-| dims | denormalised |
+Explodes each interval to the minutes it covers, **deduplicated per session-minute**. In the
+5-object design this is a CTE inside the gold MV — 140,434 rows exist only in flight.
 
 ```sql
-ENGINE = ReplacingMergeTree
-ORDER BY (minute, defn, session_id);
+SELECT DISTINCT session_id, platform, country, video_type, content_id, m AS minute
+FROM silver_active_intervals
+ARRAY JOIN range(toUInt32(start_ms/60000), toUInt32((end_ms-1)/60000)+1) AS m
 ```
 
-> **This table exists solely to kill the 9.54% double-count bug.** A session can hold two
-> active intervals inside one minute (pause + resume within 60s). Without dedup here:
-> 149,992 session-minutes instead of **136,924** — a **+9.54%** inflation.
+> **The `DISTINCT` is not optional — it kills the double-count bug.** A session can hold two
+> active intervals inside one minute, and the naive explode counts it twice.
+>
+> | | raw | deduped | double-counted | inflation |
+> |---|---:|---:|---:|---:|
+> | **`FG`** | 147,650 | **140,434** | 7,216 | **+5.14%** |
+> | `ENG` | 148,878 | 135,217 | 13,661 | +10.1% |
+>
+> **Under `FG` the cause is background/foreground cycling, NOT pause/resume.** Since pause is
+> an ACTIVE state, `pause → resume` produces one continuous interval and cannot split
+> anything. What remains are **8,351 `BG → FG` cycles completing inside 60s** — 3,504 of them
+> under 5 seconds (notification shade, transient focus loss).
 
 ---
 
-## 4. GOLD — two tables
+## 4. GOLD — one object
 
 ### G1 · `gold_concurrency_minute` — 93,007 rows (`FG`) ◀ primary serving table
 
@@ -738,7 +764,7 @@ ORDER BY (minute, defn, session_id);
 `(minute × dimensions)` collapses them almost completely:
 
 ```
- session-minutes exploded    136,924
+ session-minutes exploded    140,434
  → aggregated to full grain   90,511   ◀ only 1.26x the delta table (71,908)
 ```
 
@@ -787,31 +813,35 @@ FROM (
 );
 ```
 
-### G2 · `gold_concurrency_delta` — 21,647 rows (`FG`)
+### ❌ Why there is NO `gold_concurrency_delta` table
 
-Kept **alongside** G1, not instead of it. Deltas are update-friendly; counts are query-friendly.
+The 9-object design carried a second gold table holding ±1 deltas (21,647 rows), on the
+argument that deltas are cheaper to write and update than counts.
 
-| Column | Type |
-|---|---|
-| `minute`, dims, `defn` | as G1 |
-| `delta_a` / `delta_b` | `SimpleAggregateFunction(sum, Int32)` |
+**Both claims are true and neither matters here:**
 
-```sql
-ENGINE = SummingMergeTree
-ORDER BY (defn, country, video_type, platform, content_id, minute);
-```
-
-| | G1 counts | G2 deltas |
+| | Counts (kept) | Deltas (cut) |
 |---|---|---|
-| Rows | 90,511 | 71,908 |
-| Write cost per interval | O(duration in minutes) | **O(1)** — 2 rows |
-| Query | `max`/`avg` — trivial | needs cumsum + `WITH FILL` |
-| Extending an open session | rewrite minute range | **append one row** |
-| Correcting an end time | delete + reinsert | **one `−1` moves** |
+| Rows | 93,007 | 21,647 |
+| Write per interval | O(duration in minutes) | O(1) |
+| Query | `max`/`avg` — trivial | cumsum + `WITH FILL` |
+| **Peak produced** | **2,958** | **2,958** — identical |
 
-**Tiering:** G2 serves the hot window (open sessions, last N minutes); G1 serves finalised
-history once the watermark passes. That is the "hybrid tiering / incremental compaction" the
-problem statement asks for.
+The delta table existed to serve the **live / open-session path** cheaply. But §0.9 measured
+the hybrid read path — gold ∪ a partition-pruned raw tail — at **0.068 s**, which is fresher
+(bounded by ingest, not by refresh interval) *and* simpler. Deltas lost their reason to exist.
+
+Deltas also carry two failure modes that counts do not:
+
+- **filter-before-cumsum** — reconstruct the global curve then filter, and every excluded
+  session's ±1 is already baked into the running total
+- **`WITH FILL`** — minutes with no delta row are absent, so `avg` silently averages only the
+  minutes that exist (`max` is unaffected)
+
+Counts have neither. Storing the summable thing and deriving the rest removes both traps.
+
+> Keep deltas only if write amplification becomes the bottleneck at 100x — measure before
+> re-adding.
 
 ### ❌ Why there is NO `gold_concurrency_hour` table
 
@@ -858,32 +888,62 @@ table would save no measurable time, add a maintenance path, and be wrong 57% of
 
 ## 5. Size ledger
 
-| Layer | Table | Rows | vs bronze |
+| Layer | Object | Rows | vs bronze |
 |---|---|---:|---:|
 | 🥉 | `bronze_events` | 905,558 | 100% |
-| 🥉 | `bronze_content` | 33,464 | 3.7% |
-| 🥈 | `silver_events` | 901,348 | 99.5% |
-| 🥈 | `silver_session_dim` | 10,866 | 1.2% |
-| 🥈 | `silver_session_timeline` | 10,866 | 1.2% |
+| 🥉 | `bronze_content` → `dict_content` | 33,464 | 3.7% |
+| 🥈 | `silver_session_state` | 10,866 | 1.2% |
 | 🥈 | **`silver_active_intervals`** | **27,251** | **3.0%** |
-| 🥈 | `silver_session_minutes` | 140,434 | 15.5% |
-| 🥈 | `silver_merged_runs` | 16,279 | 1.8% |
 | 🥇 | **`gold_concurrency_minute`** | **93,007** | **10.3%** |
-| 🥇 | `gold_concurrency_delta` | 21,647 | 2.4% |
+| | *(session_minutes: 140,434 — CTE only, never stored)* | — | — |
 
 **Serving layer is 10.3% of raw**, and it grows with *minutes × observed dimension combos* —
-not with session count. Ten million sessions in one minute still produce ~25 rows.
+**not with session count**. Ten million sessions in one minute still produce ~25 rows,
+because deltas and counts from different sessions land in the same
+`(minute, platform, content_id)` cell.
+
+### Build cost
+
+| | 9-object | 5-object |
+|---|---:|---:|
+| Full rebuild, 905,558 rows | 2.90 s | **1.26 s** |
+| Full recompute from raw, no silver/gold | 0.16 s | 0.16 s |
+| Full recompute from raw @ 10x (9.05M rows) | 1.23 s | 1.23 s |
+| Gold query (filtered peak) | 0.03 s | 0.03 s |
+| Hybrid query (gold ∪ raw tail) | — | 0.068 s |
 
 ---
 
 ## 6. Open items
 
-1. **`jap` / `jpn` alias** — both Japanese, 1,760 rows, not merged by the normalisation rule.
-2. **`FixedString(32)` vs `cityHash64`** for IDs — 2x vs 8x saving; recommend lossless.
-3. **50-second gap threshold — empirically derived**, not guessed: the gap histogram
-   collapses 137x at 50s, and P(gap contains a real `AppBackgrounded`) jumps 0.5% → 50.6% at
-   the same point. Sensitivity across 45s→180s is **0.6%**.
-4. **`defn` doubles every silver/gold row.** `ENG` is a diagnostic; drop it to reclaim 2x if
-   engagement reporting isn't needed.
-5. **`country` has 1 value.** Keep in the ordering key for schema stability; it costs ~nothing
-   under `LowCardinality` and avoids a migration if the unseen day adds markets.
+1. **`cnt_a` vs `cnt_b` — the largest remaining risk (14.6%).** Boundary-instant gives 2,581,
+   any-overlap gives 2,958 on identical data. Evidence favours `cnt_a`: it converges to the
+   true value as the bucket shrinks (2,599 @ 1s → 2,581 @ 60s, a 1.7% spread), while `cnt_b`
+   diverges (2,607 @ 1s → 2,958 @ 60s → 3,999 @ 300s). **`cnt_a` is concurrency; `cnt_b` is
+   reach.** Both columns are materialised; `cnt_a` is not yet populated in the pipeline.
+2. **`defn` doubles every silver/gold row.** `ENG` is an engagement diagnostic, not a
+   competing concurrency answer. Drop it to reclaim 2x if engagement reporting isn't needed.
+3. **`jap` / `jpn`** — both Japanese, 1,760 rows, not merged by the normalisation rule.
+4. **`FixedString(32)` vs `cityHash64`** for IDs — 2x vs 8x saving; recommend the lossless one.
+5. **Sub-5s backgrounds** (3,504) — likely OS noise. Not debounced, deliberately.
+6. **Open-session path is untested on real data.** The provided file has **zero** unclosed
+   sessions; a simulated 16:30 cutoff yields **3,532 open sessions**. A passing test on this
+   file does not prove the watermark works.
+7. **Late-arriving data** — the trailing ~2 minutes are provisional (§0.9). Alerting must run
+   on settled data only.
+
+---
+
+## 7. Two pipelines, both runnable
+
+| File | Objects | Purpose |
+|---|---:|---|
+| `pipeline/01_reference_pipeline.sql` | 9 | **reference oracle** — diff ClickHouse output against this |
+| `pipeline/02_five_table.sql` | 5 | **ships** — the design documented above |
+
+```bash
+duckdb pipeline/ref.db  < pipeline/01_reference_pipeline.sql   # 2.90 s
+duckdb pipeline/five.db < pipeline/02_five_table.sql           # 1.26 s
+```
+
+Verified equivalent: **93,007 gold rows each, 0 rows differing in either direction.**

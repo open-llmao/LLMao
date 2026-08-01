@@ -884,7 +884,7 @@ to each other**. No range join, no per-minute explosion.
 
 | Approach | Rows here | At 100x | Query cost |
 |---|---:|---:|---|
-| Per-minute explosion | 136,924 | 13.7M | scan all |
+| Per-minute explosion | 140,434 | 14.0M | scan all |
 | Range self-join `s < m AND e > m` | 35,954 | 3.6M | **O(n·m)** — collapses |
 | **Delta + cumsum** | **71,908** | **7.2M** | **O(minutes in range)** |
 
@@ -908,20 +908,28 @@ This is the mechanism behind the A-vs-B gap (**2,581 vs 2,958** under `FG`).
 
 Cost of storing both: one extra `Int32` column. Removes an 18% guess.
 
-### 7.4 Edge case — the 9.54% double-count bug
+### 7.4 Edge case — the double-count bug
 
-A session can hold **two active intervals inside the same minute** (pause and resume within
-60 s). Under Definition B it is then counted twice.
+A session can hold **two active intervals inside the same minute**. Under Definition B it is
+then counted twice.
 
-```
- session-minutes, naive:    149,992
- session-minutes, deduped:  136,924
- INFLATION:                  13,068   =   +9.54%
-```
+| | raw | deduped | double-counted | inflation |
+|---|---:|---:|---:|---:|
+| **`FG`** | 147,650 | **140,434** | 7,216 | **+5.14%** |
+| `ENG` | 148,878 | 135,217 | 13,661 | +10.1% |
 
-**Fix:** merge intervals separated by less than one bucket *before* emitting deltas (cheap, do
-it in the array step of §8.3), or make Definition B count `uniqExact(session_id)` per minute
-instead of summing deltas.
+**Under `FG` the cause is background/foreground cycling, not pause/resume.** Pause is an
+ACTIVE state, so `pause → resume` yields one continuous interval and cannot split a minute.
+The remaining splits come from **8,351 `BG → FG` cycles completing inside 60s** — 3,504 of
+them under 5 seconds (OS noise).
+
+Removing pause as a state transition therefore *halves* this bug: **+5.14%** under `FG` vs
+**+10.1%** under `ENG`.
+
+**Fix:** merge intervals separated by less than one bucket *before* emitting deltas (a
+gaps-and-islands merge in the array step, §8.3), or make Definition B count
+`uniqExact(session_id)` per minute instead of summing deltas. The pipeline does the former,
+which makes the delta and count tables consistent **by construction**.
 
 ### 7.5 Edge case — missing minutes break `avg`, not `max`
 
@@ -1232,7 +1240,7 @@ and directly satisfies the tooling requirement.
 4. **Sub-5s backgrounds** (3,504) — likely OS noise. Not debounced, deliberately.
 5. **Dedup intervals within a bucket before emitting deltas (§7.4)** — **implemented**; a
    gaps-and-islands merge makes the delta and count tables consistent by construction.
-   Without it: **+9.54%** inflation (verified — it produced 618 mismatches before the fix).
+   Without it: **+5.14%** inflation under `FG` (verified — it produced 618 mismatches before the fix).
 6. **`WITH FILL` on every `avg` query (§7.5)** — sparse dimension combinations have missing
    minutes. `max` is unaffected.
 7. **User-level vs session-level concurrency.** 10,866 sessions vs 9,618 users; 61 users have

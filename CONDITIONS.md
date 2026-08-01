@@ -234,7 +234,7 @@ Order matters — later rules override earlier ones.
 | 7 | If no close: provisional close at `last_seen + 50s`, `is_open=1` | open sessions |
 | 8 | Emit `[start, end)` for every ACTIVE run | intervals |
 | 9 | Drop zero/negative-length intervals | same-ms events |
-| 10 | Merge intervals < 1 bucket apart | prevents **+9.54%** double-count |
+| 10 | Merge intervals < 1 bucket apart | prevents **+5.14%** double-count (BG/FG cycles) |
 
 ---
 
@@ -243,7 +243,7 @@ Order matters — later rules override earlier ones.
 | # | Edge case | Measured | Consequence if missed |
 |---|---|---:|---|
 | E1 | `BG→BG` / `FG→FG` repeats | 109 / 45 | **permanent** cumsum drift |
-| E2 | Two intervals in one minute | 13,068 | **+9.54%** inflation |
+| E2 | Two intervals in one minute | 7,216 | **+5.14%** inflation (BG/FG cycles inside 60s) |
 | E3 | Interval starts+ends in same minute | 14,310 (40%) | vanishes under Definition A |
 | E4 | Duplicate `SessionStart`/`End` | 13 / 14 | double-counted sessions |
 | E5 | Sessions ending backgrounded | 418 | wrongly reopened |

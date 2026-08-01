@@ -149,7 +149,7 @@ viewing (useful for content teams), while `FG` measures *concurrency* (capacity,
 7  No close? provisional close at last_seen+50s, is_open=1
 8  Emit [start,end) for each ACTIVE run
 9  Drop zero-length intervals
-10 Merge runs inside the same minute bucket    ← prevents +9.54% double-count
+10 Merge runs inside the same minute bucket    ← prevents +5.14% double-count
 ```
 
 ---
