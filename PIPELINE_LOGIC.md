@@ -42,7 +42,75 @@ Each layer addresses at least one of the five problem-statement questions (Q1: a
 
 ---
 
-## 1. Bronze layer — raw truth
+## 0.1 The simple version (read this first if the rest feels dense)
+
+Think of this like a factory assembly line with 3 stations: **Bronze → Silver → Gold**. Raw material comes in one end, a finished product comes out the other. Each station automatically pushes its output to the next station — nobody presses a button.
+
+- **Bronze** = the raw, messy data exactly as it arrived. Nothing changed.
+- **Silver** = we've cleaned it up and figured out "was this person actually watching, or was the app just open in the background?"
+- **Gold** = the final, ready-to-serve numbers — "how many people were watching at 5:06pm?"
+
+### Station 1: Bronze (raw data)
+
+Every time someone opens the app, plays a video, pauses, backgrounds the app, or closes it — that's one event, logged exactly as-is. Like a security camera recording everything, no editing. Nothing clever happens here — it's just proof of what actually happened, so we can always go back and check our work later.
+
+### Station 2: Silver (deciding who's "really" watching)
+
+This is the hard part, in three steps:
+
+**Step A — Build a "profile" for each viewing session.** For every person's session, we build one summary: when did they start, when did we last hear from them, did they ever background the app, did they ever close it. A session's data trickles in over minutes as they keep watching, so instead of waiting for the whole session to end, we update this summary a little bit *every time new data arrives* — like adding a new line to someone's diary each day instead of writing the whole diary at the end. This happens instantly, no waiting.
+
+**Step B — Turn that profile into "active time ranges."** Given everything we know about this person, when were they *actually* watching (not paused-and-forgotten, not backgrounded)? Rules we use:
+- Backgrounded the app → not watching, until they come back.
+- Haven't heard from them (no "I'm still here" signal) for more than **50 seconds** → assume they wandered off.
+- Paused the video but the app is still open and pinging us → **still counts as watching**. Someone who pauses to answer the door is still "in the room."
+
+This step needs to look at a person's *entire* history at once, so instead of updating instantly, it re-checks everything every **15 seconds**. That's the one place in this whole pipeline with a small delay — everywhere else is instant.
+
+> **Which tables, exactly, and what happens in them:**
+> - **Input:** `silver_session_state_current` — just a **VIEW** (stores nothing), the finished profile from Step A, read live.
+> - **The worker:** `mv_silver_active_intervals` — a **refreshable materialized view**. A script that wakes up every 15 seconds, recalculates, and writes the result somewhere.
+> - **Output:** `silver_active_intervals` — a real table, engine `ReplacingMergeTree(version)`. This is where "person X was watching from 5:01pm to 5:14pm" rows actually live.
+>
+> Every 15 seconds, for every person's profile, the worker:
+> 1. **Takes the explicit signals as-is** — "went to background at 5:10," "came back at 5:12."
+> 2. **Looks for silence gaps in the heartbeat list.** A 70-second gap between two heartbeats → insert a *fake* "went quiet" marker 50 seconds after the last one, and a *fake* "came back" marker at the next heartbeat. This is how we catch people who went silent without ever sending an explicit "backgrounded" signal.
+> 3. **Merges both sets of markers into one timeline**, sorted by time.
+> 4. **Deletes markers that don't actually change anything** — e.g. two "backgrounded" markers in a row (a duplicate event) collapse to one, since the second doesn't change the state.
+> 5. **Pairs up consecutive markers** — "became active at 5:01" + "became inactive at 5:14" = one row: `start=5:01, end=5:14`.
+> 6. **Throws away the "inactive" stretches** — only the "was actually watching" stretches get kept.
+>
+> **Why `ReplacingMergeTree(version)` specifically:** this calculation reruns from scratch for *every* person, every 15 seconds — not just people whose data changed. For someone with nothing new, the worker produces the exact same row it produced last cycle; `ReplacingMergeTree` recognizes the same key + same version number and just keeps one copy, no bloat. For someone who *did* get a new heartbeat, their "last seen" time moved forward, so their version number goes up, and the new row quietly replaces the old one in the background.
+
+**Step C — Watch for someone who never says goodbye.** Sometimes a person's app just vanishes — no explicit "I'm closing the app" signal ever arrives. We don't wait forever. If we haven't heard from them in 50 seconds, we assume they left and mark it "probably closed." If a signal from them shows up later after all, we quietly fix our assumption — no need to redo everything.
+
+> **How this fits into the tables above:** this isn't a separate table or separate step — it's one more input folded into the *same* worker (`mv_silver_active_intervals`) from Step B, at the same time.
+>
+> Every profile has a flag, `has_close`, that's `0` if we never actually saw an explicit "closed the app" signal. For any profile where `has_close = 0`, the worker manufactures one extra fake marker: *"treat this person as closed, 50 seconds after the last time we heard from them."* That fake marker goes through the exact same merge-and-pair-up steps from Step B (steps 3–6 above), so it behaves identically to a real "closed" signal — it just becomes the end of that person's last watching stretch. The resulting row in `silver_active_intervals` also gets flagged `is_open = 1`, so anyone reading the table knows this is a best guess, not a confirmed closure.
+>
+> **The self-correcting part:** because this whole thing reruns every 15 seconds, if that person's app *does* send more data later — a late heartbeat, or the actual "closed" signal finally arrives — their "last seen" time updates, the fake close marker automatically moves forward to match, the version number goes up, and `ReplacingMergeTree` swaps in the corrected row on the next refresh. Nobody has to notice the mistake or fix it by hand.
+
+### Station 3: Gold (the final numbers)
+
+Now that we know exactly when each person was really watching, we can answer "how many people were watching at any given minute" almost instantly, without re-checking every single person's history each time someone asks.
+
+We build **two versions** of this answer, as a cross-check against each other:
+1. **G1** — for each minute, count how many distinct people were watching. Simple and fast.
+2. **G2** — a "door counter" instead: don't ever look up *who* someone is, just tap +1 when a person walks in and -1 when they walk out, and keep a running tally. It should land on the exact same headcount as G1 — if it doesn't, that's a red flag worth investigating. Bonus: if someone stays in the room much longer than expected, G1 has to go recount everyone again, but the door counter doesn't care how long anyone stays — it only ever recorded 2 taps for that person, in and out.
+
+Having two independent methods agree gives confidence the numbers are actually correct, not just "the code ran without errors."
+
+### The one honest trade-off
+
+Everything is instant **except** the middle step (figuring out "active time ranges" and the final gold numbers) — those refresh every 15 seconds. So if you ask "how many people are watching right now," the answer could be up to 15 seconds stale. Everywhere else, zero delay.
+
+---
+
+## 0.2 The same thing, precisely (the rest of this document)
+
+The sections below say the same thing as §0.1, but in ClickHouse's own vocabulary — table names, engine names, and the exact mechanism (which kind of materialized view, why that one and not another) behind each step. Read §0.1 for the idea, read on for how it's actually built.
+
+---
 
 ### 1.1 `bronze_events_raw` (Kafka → ClickPipes → SharedMergeTree)
 
@@ -230,7 +298,21 @@ FROM ( SELECT minute, uniqExactMerge(cnt_a) AS c
 
 **What.** One row per `(minute, platform, country, video_type, content_id, delta_kind)` with a single signed `delta` counter — **no `session_id` in the schema at all**. Two deltas per interval per convention: `+1` at open, `-1` at close. Concurrency at any minute = running cumulative sum of `delta` up to that minute.
 
-**Why slim, and why no session_id.** The whole point of a session-*independent* model is that it proves the peak without ever carrying session identity forward — if the cumsum of anonymous +1/-1 events matches G1's distinct-session count, that's the strongest form of cross-validation the two approaches can offer each other. Carrying `session_id` (as an earlier draft did) doesn't buy correctness here — `SummingMergeTree` already folds identical `(minute, dims, kind)` rows by summing, and each interval contributes exactly one `+1` and one `-1`, so the sum is exact without needing a session key. Dropping it shrinks the table (~2K distinct minute/dims/kind rows instead of ~91K session-keyed rows) and removes the only thing that would have forced `ReplacingMergeTree` + `FINAL` reads.
+**Why does a second gold table exist at all, if G1 already answers the question?**
+
+Two independent reasons — one is what the problem statement explicitly asks for, the other is a real operational win G1 can't give us.
+
+**Reason 1 — the problem statement asks for it, on purpose.** It doesn't just ask for *a* concurrency model; it asks to compare a **session-aware** approach against a **session-independent** one, and to explain the trade-off. G1 is session-aware — every count it produces comes from `uniqExact(session_id)`, so it fundamentally *knows* whose session it's counting. G2 is built to answer the exact same question **without ever knowing whose session anything belongs to** — it just sees anonymous "+1 arrived" / "-1 left" events and adds them up. If two structurally different methods, built from the same source data, land on the same peak number, that's a much stronger correctness argument than one method alone — it's the same reason you'd want two independent people to count a crowd and compare notes, rather than trusting one person's count.
+
+**Reason 2 — G2 is dramatically cheaper to update when a session is still open.** This is the concrete, practical reason, and it's worth walking through with real numbers:
+
+> Say a session has been active for 10 minutes and a new heartbeat arrives extending it to 15 minutes.
+> - **In G1**, that session was already counted as "present" in 10 minute-rows. Now it needs to *also* be counted in 5 more minute-rows it wasn't in before. The size of that update grows with how long the interval got — a session that's been open for 3 hours and gets extended touches a lot of rows.
+> - **In G2**, that same session is only ever represented by **two rows, ever**: one `+1` at the moment it started, one `-1` at the moment it (currently) ends. Extending the session by 5 minutes doesn't add new rows — it just moves that single `-1` row 5 minutes later. The update cost is **constant**, regardless of whether the session has been open for 1 minute or 10 hours.
+
+Think of it like the difference between re-counting everyone in a room every time someone walks in (G1's style — accurate, but the recount gets more expensive the longer people have been sitting there) versus a **door counter**: someone taps a button on the way in, taps it again on the way out, and you just keep a running tally (G2's style — the tally update is the same 1 tap regardless of how long that person stays).
+
+**Why slim, and why no `session_id` in the schema.** Once you accept G2's whole purpose is to prove the answer *without* carrying session identity, adding `session_id` back into the table would defeat the point — it would just make G2 a more expensive copy of G1. `SummingMergeTree` already folds identical `(minute, dims, kind)` rows by summing, and each interval contributes exactly one `+1` and one `-1`, so the sum is exact without needing a session key at all. Dropping it also shrinks the table (~2K distinct minute/dims/kind rows instead of ~91K session-keyed rows) and removes the only thing that would have forced `ReplacingMergeTree` + `FINAL` reads — a plain `SummingMergeTree` is enough.
 
 **How populated.** Four branches inside one refreshable MV: `(kind='a', open)`, `(kind='a', close)`, `(kind='b', open)`, `(kind='b', close)` — `kind='a'` uses ceil/ceil boundaries (matches G1's concurrency convention), `kind='b'` uses floor/ceil (matches reach).
 
@@ -247,7 +329,7 @@ FROM ( SELECT minute,
        FROM gold_concurrency_delta WHERE delta_kind = 'a' )
 ```
 
-**What it achieves.** Q2 (session-independent alternative representation, proven not just claimed), Q3 (peak still fast — one window-sum over a few thousand rows), and the explicit "compare both approaches" ask in `README_START_HERE.md` — G1 and G2 are built from the same source by construction, so any divergence between them is a real signal, not noise.
+**What it achieves.** Q2 (session-independent alternative representation, proven not just claimed), Q3 (peak still fast — one window-sum over a few thousand rows), Q5 (a session extending its active range costs G2 exactly one row-move, regardless of how long it's been open), and the explicit "compare both approaches" ask in `README_START_HERE.md` — G1 and G2 are built from the same source by construction, so any divergence between them is a real signal, not noise.
 
 ---
 
