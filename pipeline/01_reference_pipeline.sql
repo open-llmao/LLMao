@@ -8,12 +8,6 @@
 --   (b) P(gap contains a real AppBackgrounded) jumps 0.5% -> 50.6% at exactly 50s
 SET VARIABLE gap_ms = 60000;
 
--- ================= BRONZE : exact mirror of source ==========================
-CREATE OR REPLACE TABLE bronze_events AS
-  SELECT * FROM read_csv_auto('../click-a-thon-2026/SonyLiv/data/ch-hackathon-raw-data.csv');
-CREATE OR REPLACE TABLE bronze_content AS
-  SELECT * FROM read_csv_auto('../click-a-thon-2026/SonyLiv/data/ch-hackathon-content-data.csv');
-
 -- ================= SILVER 1 : typed, normalised, deduped, enriched =========
 CREATE OR REPLACE TABLE silver_events AS
 SELECT DISTINCT ON (b.video_session_id, b.event_timestamp, b.event)
