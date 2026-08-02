@@ -19,6 +19,7 @@
 3. **Always show the SQL you ran and how many rows it read.** The evaluation criteria explicitly reward "what your queries read, not just how fast they return," and the problem statement requires "evidence they ran through your pipeline." Never present a bare number without its query.
 4. **Pick `cnt_a` vs `cnt_b` deliberately, and say which you picked and why.** These are not interchangeable — see §1.
 5. **Default `country = 'india'`** unless the user names another — this dataset has exactly one country value; don't ask the user to disambiguate something the data can't vary.
+6. **Numbers cited in this doc's examples come from the local DuckDB oracle, not necessarily the live cloud instance.** As of this writing, the cloud ClickHouse service has unrelated infrastructure (`_v1`-suffixed tables) actively modifying `bronze_events_raw`, and its interval reconstruction has an unresolved ~8% gap versus the oracle. If you're running live against the cloud instance, treat any discrepancy from the numbers in this doc as expected until that's resolved — re-derive from cloud data directly rather than assuming this doc's example numbers still hold.
 
 ---
 
@@ -193,12 +194,12 @@ Three signals, three different rulings — this is not one rule, it's three:
 
 | Case named in the question | Ruling | Verify with |
 |---|---|---|
-| **Heartbeat is missing** | Silence > 50s between two `live_ts` values → inferred backgrounded. Threshold is empirically derived (gap histogram collapses 137× at 50s; independently, the probability a gap of that length contains a real `AppBackgrounded` jumps from 0.5% to 50.6% at the same point). | `SELECT ts - lagInFrame(ts) OVER (...) AS gap FROM ... WHERE gap > 50000` on `silver_session_state_current.live_ts` |
-| **Player is paused** | **Active.** `pause`/`resume`/`speed-pause`/`AdPause` are `event` values hidden inside `event_type='VideoHeartbeat'` and are treated as no state change — the session stays whatever it was. | Heartbeats keep firing during pause in this data — see §6.6 |
+| **Heartbeat is missing** | Silence > 60s between two `live_ts` values → inferred backgrounded. Threshold is taken directly from `dataset_details.md`'s stated heartbeat cadence ("passed every 1 minute"), not empirically derived — see README.md §2.5. Cross-check only: the actual dominant heartbeat spacing is ~40s, and `P(gap contains a real AppBackgrounded)` jumps sharply right after 41s in both datasets, so 60s sits safely inside the high-probability zone. | `SELECT ts - lagInFrame(ts) OVER (...) AS gap FROM ... WHERE gap > 60000` on `silver_session_state_current.live_ts` |
 | **App is backgrounded** | **Inactive**, immediately, on the explicit `AppBackgrounded` event — no threshold needed since this is a direct signal, not an inference. | `event_type = 'AppBackgrounded'` in `bronze_events_raw` |
 
 ```sql
--- reproduce the 50s threshold's own evidence: gap histogram around the cliff
+-- reproduce the 60s threshold's cross-check evidence: gap histogram around the cliff
+-- (this is a SANITY CHECK on the spec-stated value, not how the value was chosen)
 SELECT
     multiIf(gap BETWEEN 40000 AND 50000, '40-50s', gap BETWEEN 50000 AND 60000, '50-60s', 'other') AS bucket,
     count() AS n
@@ -245,20 +246,61 @@ SELECT max(c) AS peak FROM (
 **Scenario 2, quoted directly from the problem statement:**
 > *"concurrency varies across dimension combinations: a dimension like platform and a content might peak at one minute, while a combination like platform + country might reach its peak at an entirely different minute."*
 
-**Live proof on this dataset** (§4.5's query, actual output):
+**Live proof on this dataset**, verified against the local DuckDB oracle (see the data-source note in `README.md` §4 — cloud query results shouldn't be trusted for this comparison right now):
 
 | Platform | Peak | Peak minute |
 |---|---:|---|
-| ANDROID_PHONE | 1,600 | 10:56 |
-| IPHONE | 320 | 10:56 |
-| SONY_ANDROID_TV | 311 | **11:00** |
-| JIO_ANDROID_TV | 221 | **11:01** |
-| SAMSUNG_HTML_TV | 68 | 10:56 |
-| Mweb | 63 | **11:05** |
-| XIAOMI_ANDROID_TV | 42 | **10:50** |
-| LG_HTML_TV | 25 | **11:01** |
+| ANDROID_PHONE | 1,572 | 16:26 |
+| SONY_ANDROID_TV | 309 | **16:30** |
+| IPHONE | 307 | 16:26 |
+| JIO_ANDROID_TV | 203 | **16:31** |
+| Mweb | 60 | **16:33** |
+| SAMSUNG_HTML_TV | 54 | **16:19** |
+| XIAOMI_ANDROID_TV | 41 | **16:20** |
+| ANDROID_TAB | 38 | **16:27** |
+| FIRE_TV | 32 | **16:21** |
+| LG_HTML_TV | 22 | **16:31** |
 
-Peaks spread across a 15-minute window (10:50 → 11:05) — confirmed, not assumed. **Rule that follows: `max()` can never be pre-aggregated per dimension and then summed to get a global figure** — each dimension slice must be queried independently, at query time, after filters are applied.
+Peaks spread across a 14-minute window (16:19 → 16:33) — confirmed, not assumed. **Rule that follows: `max()` can never be pre-aggregated per dimension and then summed to get a global figure** — each dimension slice must be queried independently, at query time, after filters are applied.
+
+### 5.3.5 The 60-second bucket is itself an approximation — how to get the *exact* peak, cheaply
+
+`cnt_a`/`cnt_b` are both 60-second-bucketed approximations of a true, continuous-time question ("what was the highest number of people ever watching at the exact same instant"). On this dataset (using `gap_ms=60000`, per README.md §2.5): `cnt_a` = 2,592 (undercounts the true peak by 15 — it only checks presence exactly at each minute's top-tick, missing the true peak if it occurs mid-minute), `cnt_b` = 2,965 (overcounts by 358 — it counts anyone who touched a minute at all, even people who were never simultaneously present with each other). **The true, exact peak is 2,607.**
+
+**Getting the exact answer without a full rescan — the two-phase pattern:**
+
+```sql
+-- Phase 1: cheap, pre-aggregated. cnt_b is a mathematically guaranteed upper bound
+-- for the true peak within any minute (anyone truly concurrent at any instant inside
+-- the minute obviously "touches" it too) — so max(cnt_b) tells you exactly which
+-- minute to look closer at, at the cost of reading a few dozen rows.
+WITH candidate AS (
+    SELECT minute, uniqExactMerge(cnt_b) AS c
+    FROM gold_concurrency_minute GROUP BY minute
+    ORDER BY c DESC LIMIT 1
+)
+SELECT minute FROM candidate;
+
+-- Phase 2: expensive but exact, and BOUNDED — only sweep the sessions that actually
+-- touch that one candidate minute (a few thousand rows), never the whole dataset.
+WITH candidate_sessions AS (
+    SELECT session_id, start_ms, end_ms
+    FROM silver_active_intervals
+    WHERE intDiv(start_ms, 60000) <= {candidate_minute_id}
+      AND intDiv(end_ms - 1, 60000) + 1 > {candidate_minute_id}
+),
+events AS (
+    SELECT start_ms AS t, 1 AS d FROM candidate_sessions
+    UNION ALL
+    SELECT end_ms AS t, -1 AS d FROM candidate_sessions
+)
+SELECT max(live) AS exact_peak
+FROM ( SELECT sum(d) OVER (ORDER BY t, d ASC
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS live
+       FROM events );
+```
+
+This reads ~3,000 rows for the exact refinement step (verified on this dataset) instead of rescanning all 905,558 raw events or all 26,975 intervals — genuinely exact, still cheap. **Use `cnt_a` for routine filtered/windowed queries** (fast, close enough — off by <1% here); **use this two-phase pattern only when a question specifically asks for the true/exact peak.**
 
 ### 5.4 *"How does the model stay filter-friendly across common business dimensions: platform, country, content, video type, time grain?"*
 
@@ -283,7 +325,7 @@ These are not hypothetical. Each one was checked against the live data, and each
 
 Mechanism, precisely:
 1. A session's `has_close` flag is `maxMerge(has_close_state)` — true only if a `VideoSessionEnd` was ever seen.
-2. For any session where `has_close = 0`, the interval-building algorithm emits a **synthetic close** at `last_seen_ms + 50s` (the same 50s threshold as gap-inference — see §5.1) and flags that interval `is_open = 1`.
+2. For any session where `has_close = 0`, the interval-building algorithm emits a **synthetic close** at `last_seen_ms + 60s` (the same 60s threshold as gap-inference — see §5.1) and flags that interval `is_open = 1`.
 3. This gives every query a **deterministic snapshot** rather than an ever-growing open interval — concurrency at any minute is answerable immediately, without waiting for a close that may never come.
 4. If a real heartbeat *or* a late `VideoSessionEnd` arrives afterward, `silver_active_intervals` is `ReplacingMergeTree(version)` keyed by `version = last_seen_ms` — the newer row wins at merge. **No rebuild, no rescan of unaffected sessions.**
 
@@ -349,7 +391,7 @@ LEFT JOIN (
 
 ### 6.6 The very last event a session ever produces is a `pause` — does that break anything?
 
-No — `pause` is a liveness signal (see §5.1), not a distinguished terminal state. If a session pauses and then genuinely goes silent forever with no `VideoSessionEnd`, it's handled identically to any other silent tail: the watermark in §6.1 fires at `last_seen_ms + 50s`, where `last_seen_ms` is the timestamp of that last heartbeat (which fired *during* the pause — heartbeats do not stop when paused, confirmed: 94,590 heartbeat rows recorded while the player state was paused in this dataset). The mechanism doesn't check what the player was doing before it went silent, only *how long* it's been silent.
+No — `pause` is a liveness signal (see §5.1), not a distinguished terminal state. If a session pauses and then genuinely goes silent forever with no `VideoSessionEnd`, it's handled identically to any other silent tail: the watermark in §6.1 fires at `last_seen_ms + 60s`, where `last_seen_ms` is the timestamp of that last heartbeat (which fired *during* the pause — heartbeats do not stop when paused, confirmed: 94,590 heartbeat rows recorded while the player state was paused in this dataset). The mechanism doesn't check what the player was doing before it went silent, only *how long* it's been silent.
 
 ### 6.7 A session's platform, country, content, or video_type changes mid-session
 

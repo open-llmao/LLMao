@@ -3,3 +3,6 @@
 *.sqlite
 *.sqlite3
 .secrets/
+SonyLiv/unseen_data/ch-hackathon-content-data_surprise.csv
+.DS_Store
+SonyLiv/unseen_data/ch-hackathon-raw-data_surprise.csv

@@ -74,7 +74,7 @@ This is the hard part, in three steps:
 
 **Step B — Turn that profile into "active time ranges."** Given everything we know about this person, when were they *actually* watching (not paused-and-forgotten, not backgrounded)? Rules we use:
 - Backgrounded the app → not watching, until they come back.
-- Haven't heard from them (no "I'm still here" signal) for more than **50 seconds** → assume they wandered off.
+- Haven't heard from them (no "I'm still here" signal) for more than **60 seconds** → assume they wandered off.
 - Paused the video but the app is still open and pinging us → **still counts as watching**. Someone who pauses to answer the door is still "in the room."
 
 This step needs to look at a person's *entire* history at once, so instead of updating instantly, it re-checks everything every **15 seconds**. That's the one place in this whole pipeline with a small delay — everywhere else is instant.
@@ -100,18 +100,18 @@ This step needs to look at a person's *entire* history at once, so instead of up
 >
 > Step B's worker then:
 > 1. **Takes the explicit signals as-is.**
-> 2. **Scans the heartbeat list for gaps over 50 seconds.** Finds one: `5:14:00 → 5:22:00` is an 8-minute gap. Manufactures two fake signals: `5:14:50→INACTIVE` (50 seconds after the last heartbeat) and `5:22:00→ACTIVE` (when they came back).
+> 2. **Scans the heartbeat list for gaps over 60 seconds.** Finds one: `5:14:00 → 5:22:00` is an 8-minute gap. Manufactures two fake signals: `5:15:00→INACTIVE` (60 seconds after the last heartbeat) and `5:22:00→ACTIVE` (when they came back).
 > 3. **Merges everything into one sorted timeline:**
 >    ```
 >    5:01:00 → ACTIVE
 >    5:10:00 → INACTIVE
 >    5:10:05 → ACTIVE
->    5:14:50 → INACTIVE   (fake/gap-inferred — treated identically to a real signal)
+>    5:15:00 → INACTIVE   (fake/gap-inferred — treated identically to a real signal)
 >    5:22:00 → ACTIVE
 >    ```
 > 4. **Walks through that timeline and pairs up every ACTIVE-to-INACTIVE flip.** Each pair becomes one row:
 >    - `[5:01:00 → 5:10:00)` — one row
->    - `[5:10:05 → 5:14:50)` — a second row
+>    - `[5:10:05 → 5:15:00)` — a second row
 >    - `[5:22:00 → ...)` — a third row, still open (handled by Step C below)
 >
 > **This is how it "knows"** — it isn't calculating a count from a formula. It's walking through the full, ordered list of every state change (real and gap-inferred) and creating a new row every time the state flips from "watching" to "not watching." Two separate ACTIVE stretches means two flips means two rows — that falls out of the walk-through automatically, no special-casing needed. This is also exactly why `min`/`max` alone would never have been enough: `max(last_seen)` only tells you the very last timestamp — it throws away the fact that there was a gap in the middle at all.
@@ -123,7 +123,7 @@ This step needs to look at a person's *entire* history at once, so instead of up
 >
 > Every 15 seconds, for every person's profile, the worker:
 > 1. **Takes the explicit signals as-is** — "went to background at 5:10," "came back at 5:12."
-> 2. **Looks for silence gaps in the heartbeat list.** A 70-second gap between two heartbeats → insert a *fake* "went quiet" marker 50 seconds after the last one, and a *fake* "came back" marker at the next heartbeat. This is how we catch people who went silent without ever sending an explicit "backgrounded" signal.
+> 2. **Looks for silence gaps in the heartbeat list.** A 70-second gap between two heartbeats → insert a *fake* "went quiet" marker 60 seconds after the last one, and a *fake* "came back" marker at the next heartbeat. This is how we catch people who went silent without ever sending an explicit "backgrounded" signal.
 > 3. **Merges both sets of markers into one timeline**, sorted by time.
 > 4. **Deletes markers that don't actually change anything** — e.g. two "backgrounded" markers in a row (a duplicate event) collapse to one, since the second doesn't change the state.
 > 5. **Pairs up consecutive markers** — "became active at 5:01" + "became inactive at 5:14" = one row: `start=5:01, end=5:14`.
@@ -131,11 +131,11 @@ This step needs to look at a person's *entire* history at once, so instead of up
 >
 > **Why `ReplacingMergeTree(version)` specifically:** this calculation reruns from scratch for *every* person, every 15 seconds — not just people whose data changed. For someone with nothing new, the worker produces the exact same row it produced last cycle; `ReplacingMergeTree` recognizes the same key + same version number and just keeps one copy, no bloat. For someone who *did* get a new heartbeat, their "last seen" time moved forward, so their version number goes up, and the new row quietly replaces the old one in the background.
 
-**Step C — Watch for someone who never says goodbye.** Sometimes a person's app just vanishes — no explicit "I'm closing the app" signal ever arrives. We don't wait forever. If we haven't heard from them in 50 seconds, we assume they left and mark it "probably closed." If a signal from them shows up later after all, we quietly fix our assumption — no need to redo everything.
+**Step C — Watch for someone who never says goodbye.** Sometimes a person's app just vanishes — no explicit "I'm closing the app" signal ever arrives. We don't wait forever. If we haven't heard from them in 60 seconds, we assume they left and mark it "probably closed." If a signal from them shows up later after all, we quietly fix our assumption — no need to redo everything.
 
 > **How this fits into the tables above:** this isn't a separate table or separate step — it's one more input folded into the *same* worker (`mv_silver_active_intervals`) from Step B, at the same time.
 >
-> Every profile has a flag, `has_close`, that's `0` if we never actually saw an explicit "closed the app" signal. For any profile where `has_close = 0`, the worker manufactures one extra fake marker: *"treat this person as closed, 50 seconds after the last time we heard from them."* That fake marker goes through the exact same merge-and-pair-up steps from Step B (steps 3–6 above), so it behaves identically to a real "closed" signal — it just becomes the end of that person's last watching stretch. The resulting row in `silver_active_intervals` also gets flagged `is_open = 1`, so anyone reading the table knows this is a best guess, not a confirmed closure.
+> Every profile has a flag, `has_close`, that's `0` if we never actually saw an explicit "closed the app" signal. For any profile where `has_close = 0`, the worker manufactures one extra fake marker: *"treat this person as closed, 60 seconds after the last time we heard from them."* That fake marker goes through the exact same merge-and-pair-up steps from Step B (steps 3–6 above), so it behaves identically to a real "closed" signal — it just becomes the end of that person's last watching stretch. The resulting row in `silver_active_intervals` also gets flagged `is_open = 1`, so anyone reading the table knows this is a best guess, not a confirmed closure.
 >
 > **The self-correcting part:** because this whole thing reruns every 15 seconds, if that person's app *does* send more data later — a late heartbeat, or the actual "closed" signal finally arrives — their "last seen" time updates, the fake close marker automatically moves forward to match, the version number goes up, and `ReplacingMergeTree` swaps in the corrected row on the next refresh. Nobody has to notice the mistake or fix it by hand.
 >
@@ -151,12 +151,12 @@ This step needs to look at a person's *entire* history at once, so instead of up
 >                           why, and no "backgrounded" signal, no "closed the app"
 >                           signal, nothing. The data just stops.
 > ```
-> **Why Step B's own gap-detection can't catch this by itself:** Step B looks for silence by comparing *pairs* of heartbeats — "was there more than 50 seconds between this one and the next one?" But there's no "next one" after 5:08:00. There's nothing to pair it with. Step B is structurally blind to the *tail end* of a session — that's precisely the hole Step C exists to plug.
+> **Why Step B's own gap-detection can't catch this by itself:** Step B looks for silence by comparing *pairs* of heartbeats — "was there more than 60 seconds between this one and the next one?" But there's no "next one" after 5:08:00. There's nothing to pair it with. Step B is structurally blind to the *tail end* of a session — that's precisely the hole Step C exists to plug.
 >
 > **What happens, cycle by cycle:**
-> - **First refresh after 5:08:00.** `has_close = 0`, so Step C manufactures one fake signal at `5:08:50pm` (50 seconds after the last heartbeat). Row: `[5:00:00 → 5:08:50)`, `is_open = 1` — "our best guess, not confirmed."
+> - **First refresh after 5:08:00.** `has_close = 0`, so Step C manufactures one fake signal at `5:09:00pm` (60 seconds after the last heartbeat). Row: `[5:00:00 → 5:09:00)`, `is_open = 1` — "our best guess, not confirmed."
 > - **Every 15-second refresh after that, with nothing new arriving:** the calculation reruns, produces the *identical* row and version number, `ReplacingMergeTree` keeps just the one copy. No change, no waste.
-> - **3 minutes later, a delayed heartbeat from `5:11:00pm` finally arrives** (phone briefly reconnected). "Last heard from them" moves to `5:11:00`. Next cycle, Step C fires again with a *new* fake signal at `5:11:50pm`. Row becomes `[5:00:00 → 5:11:50)` with a bigger version number — `ReplacingMergeTree` swaps out the stale row for this corrected one.
+> - **3 minutes later, a delayed heartbeat from `5:11:00pm` finally arrives** (phone briefly reconnected). "Last heard from them" moves to `5:11:00`. Next cycle, Step C fires again with a *new* fake signal at `5:12:00pm`. Row becomes `[5:00:00 → 5:12:00)` with a bigger version number — `ReplacingMergeTree` swaps out the stale row for this corrected one.
 > - **A few minutes after that, the real "session closed" signal finally arrives** (queued somewhere, delayed in transit) — timestamped `5:15:00pm`. `has_close` becomes `1`. Step C doesn't fire at all this time; the real signal is used instead. Final row: `[5:00:00 → 5:15:00)`, `is_open = 0` — no longer a guess, confirmed.
 >
 > The "provisional close" isn't a one-shot guess we're stuck with — it's a placeholder that keeps getting corrected, for free, every 15 seconds, for as long as it takes for the truth to catch up.
@@ -343,8 +343,8 @@ The cost is honest: any interval affected by activity in the last refresh window
 The active-state timeline is built by unioning three sources of "state at time t":
 
 1. **`tr`** — explicit transitions (`ARRAY JOIN tr_ts, tr_st` on `silver_session_state_current`). Values: BG=0, FG=1, close=-1.
-2. **`gaps`** — for every consecutive pair of `live_ts` more than 50s apart, emit a synthetic BG at `prev+50s` and a synthetic FG at the next live_ts. This is what handles **"heartbeat missing"** without an explicit BG event (Q1). The 50s threshold was empirically derived (labelled-BG probability jumps from 0.5% below 50s to 50.6% above).
-3. **`wm`** — for sessions with `has_close=0`, emit `-1` at `last_seen_ms + 50s`. This is the watermark closure — deterministic snapshot boundary. (In this dataset every session has `has_close=1`, so `wm` is empty; the code path is load-bearing for the unseen day.)
+2. **`gaps`** — for every consecutive pair of `live_ts` more than 60s apart, emit a synthetic BG at `prev+60s` and a synthetic FG at the next live_ts. This is what handles **"heartbeat missing"** without an explicit BG event (Q1). The 60s threshold is taken directly from `dataset_details.md`'s stated heartbeat cadence ("passed every 1 minute"), not empirically derived — see README.md §2.5 for the full reasoning, including a cross-check against the raw data.
+3. **`wm`** — for sessions with `has_close=0`, emit `-1` at `last_seen_ms + 60s`. This is the watermark closure — deterministic snapshot boundary. (In this dataset every session has `has_close=1`, so `wm` is empty; the code path is load-bearing for the unseen day.)
 
 The three sources are UNION-ed, deduped on `(session_id, ts)` by `min(st)` (transitions win over gaps at the same ts), then reduced to state-change rows via a windowed lag. Adjacent state-change rows `(a, st) → (b, next_st)` form the interval `[a, b)`. We keep only those where `st = 1` (foreground).
 
@@ -501,7 +501,7 @@ The evaluation criteria (from `PROBLEM_STATEMENT.md`):
 
 | Criterion | This design's answer |
 |---|---|
-| **Correct** — foreground-only, matches ground truth | 50s gap → BG classification is empirically derived. Pause treated as ACTIVE. `uniqExact` in G1 eliminates the double-count bug that inflated peak by up to +23% in an earlier build; verified gold matches its own source (`silver_active_intervals`) exactly. |
+| **Correct** — foreground-only, matches ground truth | 60s gap → BG classification is taken directly from the spec's stated heartbeat cadence, not an assumption. Pause treated as ACTIVE. `uniqExact` in G1 eliminates the double-count bug that inflated peak by up to +23% in an earlier build; verified gold matches its own source (`silver_active_intervals`) exactly. |
 | **Fast** — dashboard latency with filters | Gold ORDER BY prefix `(country, video_type, platform, content_id, minute)` prunes benchmark queries to a small fraction of the table. |
 | **Update-friendly** — open sessions absorbing heartbeats | `silver_session_state` updates with **zero gap** via true incremental MV + AggregateFunction states. Intervals and gold absorb updates within a **bounded 15s window** via refreshable MVs chained with `DEPENDS ON` — never a full rebuild, never a stale gold read against a half-updated interval set. |
 | **Explained** — trade-off thinking | This file plus `README.md` and `LLM_QUERY_GUIDE.md`. Every engine choice justified against alternatives, including the two real ClickHouse constraints that shaped the final design: incremental MVs can't see cross-block history, and refreshable MVs don't chain into incremental MVs via ordinary INSERT semantics. |
@@ -539,4 +539,4 @@ These are documented here because every one of them **failed silently** — no e
 
 ---
 
-*Every design decision here has been checked against the DuckDB reference oracle (`pipeline/01_reference_pipeline.sql`) which byte-matches the 5-object build on gold (93,007 rows, peak cnt_a=2,581, cnt_b=2,958). The cloud pipeline is now fully MV-driven, zero manual INSERTs, and gold is verified correct relative to its own upstream source; a residual ~3% gap vs the oracle traces to an interval-count difference (25,149 vs 27,251) still open for investigation. The exact DDL for every table described in this file lives in `pipeline/04_ddl_annotated.sql`.*
+*Every design decision here has been checked against the DuckDB reference oracle (`pipeline/01_reference_pipeline.sql`, `pipeline/02_five_table.sql`) which byte-matches the 5-object build on gold (93,007 rows, peak cnt_a=2,592, cnt_b=2,965; the true unbucketed peak is 2,607 — see `LLM_QUERY_GUIDE.md` §5.3.5 for the exact-peak methodology; these use `gap_ms=60000` per README.md §2.5, taken from the spec's stated heartbeat cadence, not the earlier empirically-derived 50000 value). This local oracle is currently the trusted source of numbers for this project — the ClickHouse Cloud deployment showed a different peak (2,670) at one point, traced to an unresolved ~8% interval-reconstruction gap (25,149 cloud vs 27,251 oracle, both measured at the earlier `gap_ms=50000`, not yet re-measured at 60000) plus the later discovery that the cloud instance has unrelated infrastructure (`_v1`-suffixed tables) actively modifying `bronze_events_raw` concurrently with our queries. Treat cloud-derived numbers as unverified until both are resolved. The exact DDL for every table described in this file lives in `pipeline/04_ddl_annotated.sql`.*

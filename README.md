@@ -84,7 +84,7 @@ Everything downstream depends on these calls. Written so a reviewer who has neve
 | Signal | Source column | Effect |
 |---|---|---|
 | `AppBackgrounded` | `event_type` | explicit background → INACTIVE |
-| Heartbeat silence > 50s | inferred (see §2.4) | → INACTIVE |
+| Heartbeat silence > 60s | inferred (see §2.4) | → INACTIVE |
 | `VideoSessionEnd` | `event_type` | terminal — session never reopens |
 
 ### 2.4 Assumption: **pause is ACTIVE, not inactive**
@@ -99,24 +99,25 @@ Everything downstream depends on these calls. Written so a reviewer who has neve
 | **Paused** | **yes — 94,590 rows** | client keeps reporting; session is genuinely still alive |
 | Backgrounded | no (only boundary artifacts) | 4,475 rows |
 
-Silence means *gone*. Pause does not. A secondary "engaged-viewing" definition (pause = inactive) was built and validated as a diagnostic metric for content teams (peak 2,844 vs 2,958 primary on the reference dataset) but is **not** the primary concurrency answer.
+Silence means *gone*. Pause does not. A secondary "engaged-viewing" definition (pause = inactive) was built and validated as a diagnostic metric for content teams (peak 2,844 vs 2,958 primary on the reference dataset, both measured at the earlier `gap_ms=50000`; not yet re-measured at the current 60000) but is **not** the primary concurrency answer.
 
-### 2.5 Assumption: **50-second heartbeat-silence threshold**
+### 2.5 **60-second heartbeat-silence threshold — stated in the spec, not assumed**
 
-Heartbeats fire roughly every 30–40s in this dataset (documented as ~60s in `dataset_details.md` — measured cadence is faster). We must decide: how long can a session go silent before we infer it backgrounded?
+`dataset_details.md` (data dictionary, `event_type` column — identical wording repeated verbatim in `unseen_data/spec.md`) states:
 
-**Derived empirically, from two independent signals that agree:**
+> "The heartbeat event type is a periodic event which is currently passed every 1 minute."
 
-1. **The gap histogram collapses 137× at 50s** — most gaps are just normal heartbeat cadence (40–50s bucket: 100,934 occurrences); real silences are rare beyond it (50–60s bucket: 737 occurrences).
-2. **Validated against labelled `AppBackgrounded` events** — the probability a gap of this length actually contains a real background event jumps 100×  at the same point:
+Read literally, this settles the question directly: if no heartbeat (or any other event) has arrived within 1 minute of the last one, the session is INACTIVE from that point until the next event arrives. `gap_ms = 60000` implements exactly that rule. This is **not** an assumption we made up — it's the dataset's own documented cadence, taken at face value.
+
+**Cross-checked against the raw data (not the basis for the value, just a sanity check on it):** the actual dominant heartbeat spacing in the raw data is ~40s in both the original and unseen datasets, not 60s. Building gaps from heartbeat-to-heartbeat spacing only (not all events — an `AppBackgrounded` event's own timestamp is always a gap *endpoint*, never *inside* a gap, if gaps are built from all events; this is a real methodology fix, not a stylistic one) and checking `P(gap contains a real labelled AppBackgrounded)`:
 
 | Gap length | P(gap contains a real background event) |
 |---|---:|
-| 40–50s | 0.5% |
-| **50–60s** | **50.6%** |
-| 300s+ | 72.9% |
+| 40–41s (dominant cadence) | ~0.01–0.16% |
+| 41–45s | jumps to double digits |
+| **60s+** | **safely inside the high-probability zone in both datasets** |
 
-**Sensitivity is low.** Sweeping the threshold from 45s to 180s moves the peak by only 0.6% — most long gaps are already explained by an explicit `AppBackgrounded` event; gap-inference is a safety net for the minority where that event was lost in transit.
+So the spec's literal 60s does not contradict the data — it's simply more conservative than the tightest defensible value (~41s). **Sensitivity is low either way:** moving between 45s, 50s, and 60s changes peak concurrency by well under 1% on both the original and unseen datasets — this constant is not a source of meaningful disagreement, whichever end of the range you pick, but 60s is what we use because it's what the spec states.
 
 ### 2.6 Assumption: idempotent transition handling
 
@@ -145,7 +146,7 @@ We accept a **bounded 15-second staleness window** on `silver_active_intervals` 
 
 ### 2.8 Assumption: open sessions get a synthetic close (watermark), not indefinite growth
 
-If a session has no `VideoSessionEnd` (`has_close = 0`), we emit a synthetic close at `last_seen_ms + 50s` and flag the interval `is_open = 1`. This gives every query a deterministic snapshot instead of an ever-growing open interval. When a real heartbeat or `VideoSessionEnd` arrives later, `ReplacingMergeTree(version)` collapses the provisional row in favor of the newer one — no rebuild, no rescan.
+If a session has no `VideoSessionEnd` (`has_close = 0`), we emit a synthetic close at `last_seen_ms + 60s` and flag the interval `is_open = 1`. This gives every query a deterministic snapshot instead of an ever-growing open interval. When a real heartbeat or `VideoSessionEnd` arrives later, `ReplacingMergeTree(version)` collapses the provisional row in favor of the newer one — no rebuild, no rescan.
 
 **This dataset has 0 open sessions** (every one of the 10,866 sessions closes cleanly) — the watermark path is dead code *here*, but load-bearing for the unseen day. A truncation experiment confirmed the scale this matters at: cutting the file mid-stream at an arbitrary point leaves roughly a third of sessions open.
 
@@ -165,9 +166,15 @@ A session is denormalized to one `(platform, country, video_type, content_id)` t
 |---|---|---|
 | Definition | Session's interval **fully covers** the minute instant | Session **touches** the minute at all |
 | Boundary rule | `ceil(start/60) ≤ M < ceil(end/60)` | `floor(start/60) ≤ M ≤ floor((end-1)/60)` |
-| Measured peak (this dataset) | **2,670** | **3,022** |
-| Measured avg | 31.95 | 36.81 |
+| Measured peak (local DuckDB oracle — see note below) | **2,592** | **2,965** |
+| Measured avg | 32.25 | 36.26 |
 | Relationship | always ≤ `cnt_b` for the same minute | always ≥ `cnt_a` |
+
+**Neither is exact.** Both are 60-second-bucketed approximations of the true, unbucketed peak. A direct instant-by-instant sweep over every session's exact start/end timestamp (no bucketing at all) gives **2,607** — `cnt_a` undercounts this slightly (misses people who joined slightly after a minute's top-tick), `cnt_b` overcounts it (counts non-overlapping people as if they were simultaneous, since it only checks "touched this minute," not "touched it at the same instant as everyone else"). The exact number can be recovered cheaply, without a full rescan, by using `cnt_b` to identify the candidate peak minute (a safe upper bound) and then running the exact sweep only on the sessions active during that one minute — see `LLM_QUERY_GUIDE.md` §5.3 for the worked query.
+
+> **These numbers use `gap_ms = 60000` (1 minute), per §2.5 — taken literally from the spec's stated heartbeat cadence, not the earlier 50000 empirically-derived value.** The change from 50s→60s moves these numbers by well under 1% (previously: 2,581 / 2,958 / 2,601 at 50s) — see §2.5 for the full reasoning and cross-check.
+
+> **Data source note.** These numbers come from the local DuckDB reference oracle (`pipeline/`), verified three independent ways. The ClickHouse Cloud deployment showed a different figure (2,670) at one point, traced to two causes: (1) an unresolved ~8% gap between the cloud's and the oracle's interval reconstruction (25,149 vs 27,251 intervals, both measured at the earlier `gap_ms=50000` — flagged as an open item, never root-caused), and (2) the cloud instance was later found to have unrelated infrastructure (`_v1`-suffixed tables) actively modifying `bronze_events_raw` while queries were being run against it. Until both are resolved, the local oracle is the trustworthy source, not the live cloud numbers. This gap has not yet been re-measured at the current `gap_ms=60000`.
 
 Full guidance on when to use which lives in [`LLM_QUERY_GUIDE.md`](LLM_QUERY_GUIDE.md) §1.
 
@@ -259,23 +266,43 @@ There is exactly one country value in the provided data. The column and every or
 
 ---
 
-## 4. Verified numbers (live, cloud, this build)
+## 4. Verified numbers (local DuckDB oracle — the trusted source; see note below)
 
 | Metric | Value |
 |---|---:|
 | `bronze_events_raw` rows | 905,558 |
 | `bronze_content_raw` rows | 33,469 |
-| Sessions (`silver_session_state_current`) | 10,866 |
+| Sessions | 10,866 |
 | Open sessions | 0 (watermark path untested on this file, load-bearing for unseen day) |
-| Live pulses / transitions | 693,792 / 61,674 |
-| `silver_active_intervals` rows | 25,149 |
-| `gold_concurrency_minute` rows | 94,464 |
-| `gold_concurrency_delta` rows | 44,959 |
-| **Peak concurrency (`cnt_a`)** | **2,670**, avg 31.95 |
-| **Peak reach (`cnt_b`)** | **3,022**, avg 36.81 |
-| `video_type = 'unk'` rows (data-quality gap, §2.10) | 3,691 / 94,464 (≈3.9%) |
+| `silver_active_intervals` rows | 26,975 (at `gap_ms=60000`; was 27,251 at the earlier 50000 value) |
+| `gold_concurrency_minute` rows | 93,007 |
+| **Peak concurrency (`cnt_a`, 60s buckets)** | **2,592**, avg 32.25 |
+| **Peak reach (`cnt_b`, 60s buckets)** | **2,965**, avg 36.26 |
+| **True peak (exact, no bucketing)** | **2,607** — see §2.11 |
+| Peak minute | 2026-07-26 16:26:00 IST |
 
-All numbers reproducible by querying the live ClickHouse Cloud instance directly — see [`LLM_QUERY_GUIDE.md`](LLM_QUERY_GUIDE.md) §4.1 for the exact query.
+> **`gap_ms = 60000` (1 minute), per §2.5.** An earlier draft of this document used `gap_ms = 50000`, framed as "empirically derived." That framing was backwards: the spec (`dataset_details.md`) already states the heartbeat cadence directly ("passed every 1 minute") — 60s is what that states literally, not an assumption to derive. The change from 50s→60s moves every number in this table by well under 1%.
+
+> **Why "local DuckDB oracle" and not "live cloud," and why the numbers here changed from an earlier draft of this file:** an earlier version of this table reported cloud-measured numbers (peak `cnt_a` = 2,670). Two problems surfaced with that:
+> 1. **An unresolved reconstruction gap (measured at the earlier `gap_ms=50000`, not yet re-measured at 60000).** The cloud's `silver_active_intervals` produces 25,149 rows; this local oracle produced 27,251 — an ~8% difference that was flagged early in the build and never root-caused.
+> 2. **Shared-instance interference.** The cloud ClickHouse service was later found to have unrelated infrastructure (`_v1`-suffixed tables, a parallel pipeline not built by this project) actively modifying `bronze_events_raw` while queries were being run against it — making any number pulled from it unverifiable at that moment.
+>
+> Until both are resolved, **the local DuckDB oracle (`pipeline/01_reference_pipeline.sql`, `pipeline/02_five_table.sql`, run directly against the raw CSV) is the trustworthy source**, not cloud query results. Every number in this table was verified at least 2 independent ways (the gold table itself, plus a direct `count(DISTINCT session_id)` against `silver_active_intervals`) before being written down here.
+
+All numbers reproducible by running `pipeline/02_five_table.sql` against `SonyLiv/data/ch-hackathon-raw-data.csv` — see [`LLM_QUERY_GUIDE.md`](LLM_QUERY_GUIDE.md) §5.3 for the exact peak-finding methodology, including how to get the exact (non-bucketed) answer cheaply.
+
+### 4.1 Unseen day (2026-07-31) — same pipeline, same `gap_ms=60000`
+
+Run via `pipeline/06_unseen_reference_pipeline.sql` (DuckDB, local, against the full 7,000,000-row `ch-hackathon-raw-data_surprise.csv`).
+
+| Metric | Value |
+|---|---:|
+| Sessions | 108,486 |
+| **Peak concurrency (`cnt_a`)** | **21,397**, avg 277.14 |
+| **Peak reach (`cnt_b`)** | **23,524**, avg 303.37 |
+| Peak minute | 2026-07-31 16:45 IST |
+
+> **A real bug was caught and fixed on this file, not present on the original dataset:** 19,860 of 108,486 sessions (18.3%) never have a `VideoSessionStart` event — they started before this single-day snapshot's window opened. Most of them (~14,000) still have real activity (heartbeats/backgrounds/closes) *inside* the window, so excluding them was silently undercounting. The fix — `watermark_open`, symmetric to the existing `watermark_close`: insert a synthetic "became active" transition at a session's earliest observed timestamp if it has no `VideoSessionStart` — changed peak concurrency by **+28%** (16,639 → 21,397). This is the kind of edge case a single-day snapshot exposes that a dataset with 0 truncated-at-start sessions (like the original) cannot.
 
 ---
 
