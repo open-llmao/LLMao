@@ -6,7 +6,7 @@
 -- Heartbeat timeout, EMPIRICALLY DERIVED (not guessed):
 --   (a) gap histogram collapses 137x at 50s  (40-50s: 100,934 gaps -> 50-60s: 737)
 --   (b) P(gap contains a real AppBackgrounded) jumps 0.5% -> 50.6% at exactly 50s
-SET VARIABLE gap_ms = 50000;
+SET VARIABLE gap_ms = 60000;
 
 -- ================= BRONZE : exact mirror of source ==========================
 CREATE OR REPLACE TABLE bronze_events AS
