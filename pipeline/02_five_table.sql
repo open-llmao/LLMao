@@ -3,12 +3,7 @@
 -- Objects: bronze_events, bronze_content(dict), silver_session_state,
 --          silver_active_intervals, gold_concurrency_minute
 -- ============================================================================
-SET VARIABLE gap_ms = 50000;
-
-CREATE OR REPLACE TABLE bronze_events AS
-  SELECT * FROM read_csv_auto('../click-a-thon-2026/SonyLiv/data/ch-hackathon-raw-data.csv');
-CREATE OR REPLACE TABLE bronze_content AS
-  SELECT * FROM read_csv_auto('../click-a-thon-2026/SonyLiv/data/ch-hackathon-content-data.csv');
+SET VARIABLE gap_ms = 60000;
 
 -- (3) session state: dims + ordered transitions + liveness, ONE table
 CREATE OR REPLACE TABLE silver_session_state AS
